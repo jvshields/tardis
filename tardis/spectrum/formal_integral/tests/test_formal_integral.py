@@ -3,14 +3,6 @@ import numpy.testing as ntest
 import pytest
 
 
-from tardis.spectrum.formal_integral.base import check, intensity_black_body
-from tardis.transport.montecarlo.configuration import montecarlo_globals
-from tardis.spectrum.formal_integral.formal_integral_numba import (
-    calculate_p_values as calculate_p_values_numba,
-    intensity_black_body as intensity_black_body_numba,
-)
-
-
 @pytest.mark.parametrize(
     "line_interaction_type",
     ("downbranch", "macroatom", pytest.param("?", marks=pytest.mark.xfail)),
