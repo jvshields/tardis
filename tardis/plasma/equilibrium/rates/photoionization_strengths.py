@@ -324,13 +324,13 @@ class AnalyticCorrectedPhotoionizationCoeffSolver(
 
     def calculate_corrected_photoionization_rate_coeff(
         self,
-        mean_intensity_photoionization_df,
-        photoionization_boltzmann_factor,
-        lte_level_population,
-        level_population,
-        lte_ion_population,
-        ion_population,
-    ):
+        mean_intensity_photoionization_df: pd.DataFrame,
+        photoionization_boltzmann_factor: pd.DataFrame,
+        lte_level_population: pd.DataFrame,
+        level_population: pd.DataFrame,
+        lte_ion_population: pd.DataFrame,
+        ion_population: pd.DataFrame,
+    ) -> pd.DataFrame:
         """
         Calculate the stimulated emission corrected photoionization rate coefficient.
 
@@ -362,6 +362,14 @@ class AnalyticCorrectedPhotoionizationCoeffSolver(
                 axis="columns",
             )
             level_population = level_population.set_axis(
+                photoionization_boltzmann_factor.columns,
+                axis="columns",
+            )
+            lte_ion_population = lte_ion_population.set_axis(
+                photoionization_boltzmann_factor.columns,
+                axis="columns",
+            )
+            ion_population = ion_population.set_axis(
                 photoionization_boltzmann_factor.columns,
                 axis="columns",
             )

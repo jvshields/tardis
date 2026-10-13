@@ -276,6 +276,170 @@ def test_bound_free_thermal_rates_solve_with_estimators(
     )
 
 
+def test_bound_free_cooling_ignores_missing_ratio_for_absent_element() -> None:
+    """A zero upper-ion population cools by zero in physical shell columns."""
+    shell_columns = pd.Index([53, 54])
+    level_index = pd.MultiIndex.from_tuples(
+        [(1, 0, 0), (1, 0, 0)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    rates = BoundFreeThermalRates(
+        pd.DataFrame(
+            {"nu": [1.0e15, 1.1e15], "x_sect": [1.0e-18, 1.0e-18]},
+            index=level_index,
+        )
+    )
+    ion_population = pd.DataFrame(
+        [[0.0, 0.0]],
+        index=pd.MultiIndex.from_tuples(
+            [(1, 1)], names=["atomic_number", "ion_number"]
+        ),
+        columns=shell_columns,
+    )
+    electron_distribution = ThermalElectronEnergyDistribution(
+        0.0 * u.erg,
+        np.array([6000.0, 7000.0]) * u.K,
+        np.array([1.0e5, 2.0e5]) / u.cm**3,
+    )
+    missing_ratio = pd.DataFrame(
+        columns=shell_columns,
+        index=pd.MultiIndex.from_tuples([], names=level_index.names),
+        dtype=float,
+    )
+
+    cooling = rates.calculate_cooling_rate(
+        ion_population, electron_distribution, missing_ratio
+    )
+
+    expected = pd.DataFrame(
+        [[0.0, 0.0]], index=level_index[:1], columns=shell_columns
+    )
+    pdt.assert_frame_equal(cooling, expected)
+
+
+def test_bound_free_cooling_does_not_insert_absent_hydrogen() -> None:
+    """Case-B handling must not add hydrogen to a helium-only solve."""
+    level_index = pd.MultiIndex.from_tuples(
+        [(2, 0, 0), (2, 0, 0)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    rates = BoundFreeThermalRates(
+        pd.DataFrame(
+            {"nu": [1.0e15, 1.1e15], "x_sect": [1.0e-18, 1.0e-18]},
+            index=level_index,
+        )
+    )
+    ion_population = pd.DataFrame(
+        [[1.0]],
+        index=pd.MultiIndex.from_tuples(
+            [(2, 1)], names=["atomic_number", "ion_number"]
+        ),
+        columns=[0],
+    )
+    electron_distribution = ThermalElectronEnergyDistribution(
+        0.0 * u.erg,
+        np.array([6000.0]) * u.K,
+        np.array([1.0e5]) / u.cm**3,
+    )
+    level_population_ratio = pd.DataFrame(
+        [[1.0]], index=level_index[:1], columns=[0]
+    )
+
+    cooling = rates.calculate_cooling_rate(
+        ion_population, electron_distribution, level_population_ratio
+    )
+
+    assert cooling.index.equals(level_index[:1])
+
+
+def test_bound_free_cooling_rejects_missing_ratio_for_populated_element() -> (
+    None
+):
+    """Do not hide missing continuum data for a populated upper ion."""
+    level_index = pd.MultiIndex.from_tuples(
+        [(1, 0, 0), (1, 0, 0)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    rates = BoundFreeThermalRates(
+        pd.DataFrame(
+            {"nu": [1.0e15, 1.1e15], "x_sect": [1.0e-18, 1.0e-18]},
+            index=level_index,
+        )
+    )
+    ion_population = pd.DataFrame(
+        [[1.0]],
+        index=pd.MultiIndex.from_tuples(
+            [(1, 1)], names=["atomic_number", "ion_number"]
+        ),
+        columns=[0],
+    )
+    electron_distribution = ThermalElectronEnergyDistribution(
+        0.0 * u.erg,
+        np.array([6000.0]) * u.K,
+        np.array([1.0e5]) / u.cm**3,
+    )
+    missing_ratio = pd.DataFrame(
+        columns=[0],
+        index=pd.MultiIndex.from_tuples([], names=level_index.names),
+        dtype=float,
+    )
+
+    with pytest.raises(KeyError, match=r"\(1, 0, 0\)"):
+        rates.calculate_cooling_rate(
+            ion_population, electron_distribution, missing_ratio
+        )
+
+
+def test_bound_free_analytic_rates_preserve_physical_shell_columns() -> None:
+    """Analytic coefficients retain the shell labels of plasma populations."""
+    shell_columns = pd.Index([53, 54])
+    level_index = pd.MultiIndex.from_tuples(
+        [(1, 0, 0), (1, 0, 0)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    unique_level_index = level_index[:1]
+    rates = BoundFreeThermalRates(
+        pd.DataFrame(
+            {"nu": [1.0e15, 1.1e15], "x_sect": [1.0e-18, 1.0e-18]},
+            index=level_index,
+        )
+    )
+    level_population = pd.DataFrame(
+        [[1.0, 2.0]], index=unique_level_index, columns=shell_columns
+    )
+    ion_population = pd.DataFrame(
+        [[0.0, 0.0]],
+        index=pd.MultiIndex.from_tuples(
+            [(1, 1)], names=["atomic_number", "ion_number"]
+        ),
+        columns=shell_columns,
+    )
+    electron_distribution = ThermalElectronEnergyDistribution(
+        0.0 * u.erg,
+        np.array([6000.0, 7000.0]) * u.K,
+        np.array([1.0e5, 2.0e5]) / u.cm**3,
+    )
+    level_population_ratio = pd.DataFrame(
+        [[1.0, 1.0]], index=unique_level_index, columns=shell_columns
+    )
+    radiation_field = DilutePlanckianRadiationField(
+        np.array([8000.0, 9000.0]) * u.K,
+        np.array([0.5, 0.4]),
+        geometry=None,
+    )
+
+    heating, cooling = rates.solve(
+        level_population,
+        ion_population,
+        electron_distribution,
+        level_population_ratio,
+        radiation_field,
+    )
+
+    pdt.assert_index_equal(heating.index, shell_columns)
+    pdt.assert_index_equal(cooling.index, shell_columns)
+
+
 def test_free_free_thermal_rates_heating_factor(
     ion_population,
     thermal_electron_distribution,
@@ -828,6 +992,32 @@ def test_thermal_balance_reconstructs_net_and_fractional_rates(
     )
     assert np.all(net_residual <= 1e-12 * thermal_scale)
     assert np.all(fractional_residual <= 1e-12)
+
+    nonthermal_heating = pd.Series(1.0, index=level_population.columns)
+    fixed_total, fixed_fractional = ThermalBalanceSolver(
+        bound_free_solver,
+        free_free_solver,
+        collisional_ionization_solver,
+        collisional_bound_solver,
+    ).solve(
+        thermal_electron_distribution,
+        level_population,
+        ion_population,
+        collisional_ionization_rate_coefficient,
+        collisional_deexcitation_rate_coefficient,
+        collisional_excitation_rate_coefficient,
+        REFERENCE_FREE_FREE_HEATING_ESTIMATOR,
+        level_population_ratio,
+        radiation_field,
+        bound_free_heating_estimator,
+        stimulated_recombination_estimator,
+        nonthermal_heating,
+    )
+    assert_allclose(fixed_total - total_heating, nonthermal_heating)
+    assert_allclose(
+        fixed_fractional - fractional_heating,
+        nonthermal_heating / cooling,
+    )
 
 
 def test_free_free_thermal_root_is_stable_to_bracket_perturbations(

@@ -12,12 +12,17 @@ from tardis.plasma.electron_energy_distribution import (
 )
 from tardis.plasma.equilibrium.evaluator import (
     PlasmaEquilibriumEvaluator,
+    calculate_lte_populations,
 )
 from tardis.plasma.equilibrium.inputs import (
+    FixedRateState,
     ShellNumberDensity,
     SobolevInputs,
 )
-from tardis.plasma.equilibrium.rate_matrix import RateMatrix
+from tardis.plasma.equilibrium.rate_matrix import (
+    RateMatrix,
+    assemble_ion_rate_matrices,
+)
 from tardis.plasma.equilibrium.rates import RadiativeRatesSolver
 from tardis.transport.montecarlo.estimators import init_estimators_continuum
 
@@ -143,6 +148,182 @@ def test_evaluator_uses_temperature_dependent_continuum_coefficients(
     )
 
 
+def test_evaluator_reports_stage_timing(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Expose progress through one complete equilibrium evaluation.
+
+    Claim
+    -----
+    Each expensive evaluator stage emits an INFO completion message so a long
+    plasma solve can be localized without changing its physics.
+
+    Regime
+    ------
+    The minimal one-shell evaluator exercises continuum, level, population,
+    opacity, thermal, and final-residual orchestration.
+
+    Verification
+    ------------
+    This is an orchestration assertion over stage labels only; it deliberately
+    makes no machine-dependent assertion about elapsed time.
+    """
+    caplog.set_level("INFO", logger="tardis.plasma.equilibrium.evaluator")
+
+    toy_evaluator.evaluate(
+        np.array([1.0e9]),
+        np.array([1.0e4]),
+        pd.DataFrame([[0.8], [0.2]], columns=[0]),
+    )
+
+    for stage in (
+        "continuum coefficients",
+        "level populations",
+        "ion populations",
+        "absolute and LTE populations",
+        "Sobolev opacities",
+        "thermal balance",
+        "final level residual",
+    ):
+        assert f"finished {stage}" in caplog.text
+    assert "Finished plasma equilibrium evaluator call 1" in caplog.text
+
+
+def test_continuum_coefficients_preserve_nonconsecutive_shell_labels(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+) -> None:
+    """Keep physical shell labels when evaluating a restricted shell set."""
+    shell_columns = pd.Index([53])
+    toy_evaluator.elemental_number_density.columns = shell_columns
+
+    (
+        _,
+        level_to_continuum_saha_factor,
+        collisional_ionization_rate_coefficient,
+        lte_ionization_factor,
+        continuum_coefficients,
+        partition_function,
+        level_boltzmann_factor,
+    ) = toy_evaluator.calculate_continuum_coefficients(np.array([1.0e4]))
+
+    frames = (
+        level_to_continuum_saha_factor,
+        collisional_ionization_rate_coefficient,
+        lte_ionization_factor,
+        continuum_coefficients.photoionization,
+        continuum_coefficients.stimulated_recombination,
+        continuum_coefficients.spontaneous_recombination,
+        continuum_coefficients.collisional_ionization,
+        partition_function,
+        level_boltzmann_factor,
+    )
+    for frame in frames:
+        assert frame.columns.equals(shell_columns)
+
+    lte_ion_population, lte_level_population = calculate_lte_populations(
+        lte_ionization_factor,
+        partition_function,
+        toy_evaluator.elemental_number_density,
+        pd.Series([1.0e8], index=shell_columns),
+        level_boltzmann_factor,
+        toy_evaluator.levels,
+    )
+    assert lte_ion_population.columns.equals(shell_columns)
+    assert lte_level_population.columns.equals(shell_columns)
+
+
+def test_fixed_ionization_enters_level_and_ion_stage_balances(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+) -> None:
+    """Use one fixed ionization coefficient in both coupled balances."""
+    transition_index = pd.MultiIndex.from_tuples(
+        [(1, 0, 0, 1)],
+        names=[
+            "atomic_number",
+            "ion_number",
+            "ion_number_source",
+            "ion_number_destination",
+        ],
+    )
+    fixed_ionization = pd.DataFrame(
+        [[4.0]], index=transition_index, columns=[0]
+    )
+    toy_evaluator.fixed_rates = FixedRateState(
+        ionization_rates=fixed_ionization
+    )
+    continuum_rates = toy_evaluator.calculate_continuum_coefficients(
+        np.array([1.0e4])
+    )[0][0]
+    level_fractions = np.array([0.5, 0.5])
+
+    _, _, fixed_ratio = toy_evaluator._calculate_level_state(
+        0,
+        1.0e9,
+        1.0e4,
+        level_fractions,
+        continuum_rates,
+        toy_evaluator.shell_number_densities[0],
+        toy_evaluator.sobolev_inputs[0],
+    )
+    toy_evaluator.fixed_rates = None
+    _, _, baseline_ratio = toy_evaluator._calculate_level_state(
+        0,
+        1.0e9,
+        1.0e4,
+        level_fractions,
+        continuum_rates,
+        toy_evaluator.shell_number_densities[0],
+        toy_evaluator.sobolev_inputs[0],
+    )
+
+    recombination_rate = (
+        continuum_rates.spontaneous_recombination[1]
+        + continuum_rates.stimulated_recombination[1]
+        + continuum_rates.collisional_recombination[1] * 1.0e9
+    ) * 1.0e9
+    npt.assert_allclose(
+        fixed_ratio - baseline_ratio,
+        4.0 / recombination_rate,
+        rtol=1e-14,
+    )
+
+    zero_rates = pd.DataFrame(0.0, index=transition_index, columns=[0])
+    ion_matrices, _ = assemble_ion_rate_matrices(
+        zero_rates,
+        zero_rates,
+        zero_rates,
+        zero_rates,
+        fixed_ionization_rates_df=fixed_ionization,
+    )
+    assert ion_matrices.at[1, 0][0, 0] == -4.0
+
+
+def test_case_b_suppresses_only_ground_state_recombination(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+) -> None:
+    """Switch between Case A and Case B without changing other rates."""
+    continuum_rates = toy_evaluator.calculate_continuum_coefficients(
+        np.array([1.0e4])
+    )[0][0]
+    arguments = (
+        0,
+        1.0e9,
+        1.0e4,
+        np.array([0.5, 0.5]),
+        continuum_rates,
+        toy_evaluator.shell_number_densities[0],
+        toy_evaluator.sobolev_inputs[0],
+    )
+
+    toy_evaluator.case_b_species = frozenset()
+    case_a_ratio = toy_evaluator._calculate_level_state(*arguments)[2]
+    toy_evaluator.case_b_species = frozenset({(1, 0)})
+    case_b_ratio = toy_evaluator._calculate_level_state(*arguments)[2]
+
+    assert case_b_ratio > case_a_ratio
+
+
 def test_evaluator_solves_reduced_levels_and_rebuilds_sobolev_state(
     toy_evaluator: PlasmaEquilibriumEvaluator,
 ) -> None:
@@ -210,6 +391,7 @@ def test_evaluator_finds_same_unique_root_from_distinct_initial_guesses(
     low_excitation_result = toy_evaluator.evaluate(
         np.array([1.0e9]), np.array([1.0e4]), low_excitation_initial_guess
     )
+    toy_evaluator._level_solution_cache.clear()
     high_excitation_result = toy_evaluator.evaluate(
         np.array([1.0e9]), np.array([1.0e4]), high_excitation_initial_guess
     )
@@ -284,6 +466,167 @@ def test_evaluator_accepts_physical_level_iterate_when_optimizer_stalls(
     assert actual[0].sum() == 1.0
     assert np.all(actual[0] >= 0.0)
     assert np.max(np.abs(actual[3])) > 1e-10
+
+
+def test_level_fallback_starts_from_best_feasible_root_evaluation(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse the lowest-residual feasible root evaluation in the fallback."""
+    evaluator = toy_evaluator
+    continuum_rates = evaluator.calculate_continuum_coefficients(
+        np.array([1.0e4])
+    )[0][0]
+    arguments = (
+        0,
+        1.0e9,
+        1.0e4,
+        np.array([0.5, 0.5]),
+        continuum_rates,
+        evaluator.shell_number_densities[0],
+        evaluator.sobolev_inputs[0],
+    )
+    best_candidate = np.array([0.3, 0.7])
+    worse_candidate = np.array([0.8, 0.2])
+    fallback_starts: list[np.ndarray] = []
+
+    def controlled_level_state(
+        *args: object, **kwargs: object
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        del kwargs
+        fractions = np.asarray(args[3])
+        return fractions - best_candidate, np.array([1.0]), 1.0
+
+    def negative_root(
+        residual: object, initial_guess: np.ndarray, **kwargs: object
+    ) -> SimpleNamespace:
+        del initial_guess, kwargs
+        residual(worse_candidate)
+        residual(best_candidate)
+        return SimpleNamespace(x=np.array([-0.1, 1.1]), nfev=2)
+
+    def bounded_fallback(
+        residual: object,
+        initial_guess: np.ndarray,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        del residual, kwargs
+        fallback_starts.append(initial_guess.copy())
+        return SimpleNamespace(x=best_candidate, nfev=1)
+
+    monkeypatch.setattr(
+        evaluator, "_calculate_level_state", controlled_level_state
+    )
+    monkeypatch.setattr(
+        "tardis.plasma.equilibrium.evaluator.root", negative_root
+    )
+    monkeypatch.setattr(
+        "tardis.plasma.equilibrium.evaluator.least_squares", bounded_fallback
+    )
+
+    evaluator._calculate_level_solution(*arguments)
+
+    npt.assert_array_equal(fallback_starts, [best_candidate])
+
+
+def test_level_fallback_considers_feasible_projection_of_root_endpoint(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the failed root's direction to improve the bounded fallback seed."""
+    evaluator = toy_evaluator
+    continuum_rates = evaluator.calculate_continuum_coefficients(
+        np.array([1.0e4])
+    )[0][0]
+    supplied_seed = np.array([0.5, 0.5])
+    projected_candidate = np.array([0.0, 1.0])
+    arguments = (
+        0,
+        1.0e9,
+        1.0e4,
+        supplied_seed,
+        continuum_rates,
+        evaluator.shell_number_densities[0],
+        evaluator.sobolev_inputs[0],
+    )
+    fallback_starts: list[np.ndarray] = []
+
+    def controlled_level_state(
+        *args: object, **kwargs: object
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        del kwargs
+        fractions = np.asarray(args[3])
+        return fractions - projected_candidate, np.array([1.0]), 1.0
+
+    def negative_root(
+        residual: object, initial_guess: np.ndarray, **kwargs: object
+    ) -> SimpleNamespace:
+        del initial_guess, kwargs
+        residual(np.array([0.8, 0.2]))
+        return SimpleNamespace(x=np.array([-0.5, 1.5]), nfev=1)
+
+    def bounded_fallback(
+        residual: object,
+        initial_guess: np.ndarray,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        del residual, kwargs
+        fallback_starts.append(initial_guess.copy())
+        return SimpleNamespace(x=projected_candidate, nfev=1)
+
+    monkeypatch.setattr(
+        evaluator, "_calculate_level_state", controlled_level_state
+    )
+    monkeypatch.setattr(
+        "tardis.plasma.equilibrium.evaluator.root", negative_root
+    )
+    monkeypatch.setattr(
+        "tardis.plasma.equilibrium.evaluator.least_squares", bounded_fallback
+    )
+
+    evaluator._calculate_level_solution(*arguments)
+
+    npt.assert_array_equal(fallback_starts, [projected_candidate])
+
+
+def test_level_solution_warm_starts_next_shell_solve(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse an accepted shell population as the next root's initial state."""
+    evaluator = toy_evaluator
+    continuum_rates = evaluator.calculate_continuum_coefficients(
+        np.array([1.0e4])
+    )[0][0]
+    supplied_seed = np.array([0.5, 0.5])
+    accepted_solution = np.array([0.3, 0.7])
+    arguments = (
+        0,
+        1.0e9,
+        1.0e4,
+        supplied_seed,
+        continuum_rates,
+        evaluator.shell_number_densities[0],
+        evaluator.sobolev_inputs[0],
+    )
+    root_starts: list[np.ndarray] = []
+
+    def controlled_root(
+        residual: object, initial_guess: np.ndarray, **kwargs: object
+    ) -> SimpleNamespace:
+        del residual, kwargs
+        root_starts.append(initial_guess.copy())
+        solution = accepted_solution if len(root_starts) == 1 else initial_guess
+        return SimpleNamespace(x=solution, nfev=1)
+
+    monkeypatch.setattr(
+        "tardis.plasma.equilibrium.evaluator.root", controlled_root
+    )
+
+    evaluator._calculate_level_solution(*arguments)
+    evaluator._calculate_level_solution(*arguments)
+
+    npt.assert_array_equal(root_starts, [supplied_seed, accepted_solution])
 
 
 def test_evaluator_rebuilds_final_residual_and_is_deterministic(
