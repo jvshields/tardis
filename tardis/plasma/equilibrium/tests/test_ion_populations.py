@@ -348,7 +348,9 @@ def test_ion_solver_reports_convergence_blocker(
             names=["atomic_number", "ion_number", "level_number"],
         ),
     )
-    caplog.set_level("INFO", logger="tardis.plasma.equilibrium.ion_populations")
+    caplog.set_level(
+        "DEBUG", logger="tardis.plasma.equilibrium.ion_populations"
+    )
 
     with pytest.raises(
         PlasmaIonizationError,
@@ -422,6 +424,10 @@ def test_ion_solver_reports_convergence_blocker(
         in caplog.text
     )
     assert "ion-matrix direct-solve consistency" not in caplog.text
+    assert not any(
+        record.levelname == "INFO" and "Ion solver iteration" in record.message
+        for record in caplog.records
+    )
 
 
 def test_shell_charge_records_terminal_root_diagnostic(

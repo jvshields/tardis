@@ -4,10 +4,13 @@ import numpy as np
 import pandas as pd
 
 from tardis.io.hdf_writer_mixin import HDFWriterMixin
+from tardis.plasma.base import BasePlasma
 from tardis.transport.montecarlo.configuration import montecarlo_globals
 
 
 class LegacyMacroAtomState(HDFWriterMixin):
+    """Legacy line-only macro-atom probabilities and transition metadata."""
+
     hdf_name = "macro_atom_state"
 
     hdf_properties = [
@@ -26,7 +29,7 @@ class LegacyMacroAtomState(HDFWriterMixin):
         destination_level_id: pd.Series,
         transition_line_id: pd.Series,
         macro_block_edge_index: pd.DataFrame | pd.Series,
-        line2macro_level_upper,
+        line2macro_level_upper: pd.Series | np.ndarray,
     ) -> None:
         """
         Initialize a LegacyMacroAtomState object.
@@ -54,7 +57,7 @@ class LegacyMacroAtomState(HDFWriterMixin):
         self.line2macro_level_upper = line2macro_level_upper
 
     @classmethod
-    def from_legacy_plasma(cls, plasma) -> Self:
+    def from_legacy_plasma(cls, plasma: BasePlasma) -> Self:
         """
         Generate a LegacyMacroAtomState object from a tardis BasePlasma.
 
@@ -96,6 +99,8 @@ class LegacyMacroAtomState(HDFWriterMixin):
 
 
 class MacroAtomState:
+    """Normalized macro-atom transitions and optional absorbing-chain data."""
+
     hdf_name = "macro_atom_state"
 
     hdf_properties = [
@@ -115,6 +120,7 @@ class MacroAtomState:
         absorbing_probability_matrix: np.ndarray | None = None,
         photo_ion_block_idx: int = -99,
         k_packet_idx: int = -99,
+        transition_mode: str = "absorbing",
     ) -> None:
         """
         Initialize a MacroAtomState object.
@@ -135,6 +141,9 @@ class MacroAtomState:
             Ndarray describing a single jump from an interaction handler activation to a state to deactivate from.
         k_packet_idx:
             Int describing the index location of the k_packet block
+        transition_mode
+            ``"absorbing"`` for the reduced transition matrix or ``"direct"``
+            for explicit packet-by-packet internal transitions.
         """
         self.transition_probabilities = transition_probabilities
         self.transition_metadata = transition_metadata
@@ -145,6 +154,7 @@ class MacroAtomState:
         self.absorbing_probability_matrix = absorbing_probability_matrix
         self.photo_ion_block_idx = photo_ion_block_idx
         self.k_packet_idx = k_packet_idx
+        self.transition_mode = transition_mode
 
     def to_legacy_format(self) -> LegacyMacroAtomState:
         """
@@ -179,7 +189,7 @@ class MacroAtomState:
 
     def sort_to_legacy(
         self, legacy_state: LegacyMacroAtomState, lines: pd.DataFrame
-    ):
+    ) -> Self:
         """
         Sort the current MacroAtomState to match the legacy MacroAtomState order.
 

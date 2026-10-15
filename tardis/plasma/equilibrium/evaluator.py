@@ -32,6 +32,9 @@ from tardis.plasma.equilibrium.rate_matrix import RateMatrix
 from tardis.plasma.equilibrium.rates.collisional_ionization_rates import (
     CollisionalIonizationRateSolver,
 )
+from tardis.plasma.equilibrium.rates.heating_cooling_rates import (
+    AdiabaticThermalRates,
+)
 from tardis.plasma.equilibrium.rates.photoionization_rates import (
     EstimatedPhotoionizationRateSolver,
 )
@@ -82,6 +85,7 @@ class PlasmaEquilibriumEvaluation:
     level_to_continuum_saha_factor: pd.DataFrame
     lte_ion_population: pd.DataFrame
     lte_level_population: pd.DataFrame
+    thermal_budget: pd.DataFrame | None = None
 
 
 def calculate_lte_populations(
@@ -304,6 +308,7 @@ class PlasmaEquilibriumEvaluator:
         radiation_field: DilutePlanckianRadiationField | None = None,
         fixed_rates: FixedRateState | None = None,
         case_b_species: Collection[tuple[int, int]] = ((1, 0),),
+        time_explosion: u.Quantity | None = None,
     ) -> None:
         """Construct an evaluator from fixed scientific inputs.
 
@@ -356,6 +361,10 @@ class PlasmaEquilibriumEvaluator:
         case_b_species : collection of tuple[int, int], optional
             Species for which direct recombination to the ground level is
             suppressed. Hydrogen is retained by default for Type IIP.
+        time_explosion : astropy.units.Quantity, optional
+            Homologous expansion age for an electron adiabatic cooling
+            estimate in the diagnostic thermal budget. This estimate is not
+            included in the thermal-balance residual.
         """
         self.photoionization_cross_sections = photoionization_cross_sections
         self.level2continuum_edge_idx = level2continuum_edge_idx
@@ -416,6 +425,7 @@ class PlasmaEquilibriumEvaluator:
         self.reference_electron_temperature = reference_electron_temperature
         self.fixed_rates = fixed_rates
         self.case_b_species = frozenset(case_b_species)
+        self.time_explosion = time_explosion
         self._level_solution_cache: dict[int, npt.NDArray[np.float64]] = {}
         self._evaluation_count = 0
 
@@ -658,7 +668,7 @@ class PlasmaEquilibriumEvaluator:
             if cached_solution is None
             else cached_solution.copy()
         )
-        logger.info(
+        logger.debug(
             "Starting equilibrium level solve for species %s in shell %s "
             "(%d levels, warm start=%s)",
             self.equilibrium_species,
@@ -812,12 +822,18 @@ class PlasmaEquilibriumEvaluator:
                 "ionized-to-neutral ratio."
             )
         self._level_solution_cache[shell_idx] = fractions.copy()
-        logger.info(
+        solve_elapsed = perf_counter() - solve_start_time
+        logger.log(
+            (
+                logging.INFO
+                if bounded_function_evaluations or solve_elapsed >= 1.0
+                else logging.DEBUG
+            ),
             "Finished equilibrium level solve for species %s in shell %s "
             "in %.3f s (root nfev=%d, bounded fallback nfev=%d)",
             self.equilibrium_species,
             shell_label,
-            perf_counter() - solve_start_time,
+            solve_elapsed,
             getattr(solution, "nfev", -1),
             bounded_function_evaluations,
         )
@@ -1143,10 +1159,10 @@ class PlasmaEquilibriumEvaluator:
         absolute_levels: pd.DataFrame,
         ion_population: pd.DataFrame | None,
         state: _LevelSolveState,
-    ) -> tuple[pd.Series | None, pd.Series | None]:
+    ) -> tuple[pd.Series | None, pd.Series | None, pd.DataFrame | None]:
         """Calculate optional thermal-balance output."""
         if self.thermal_balance_solver is None:
-            return None, None
+            return None, None, None
         solver_arguments = deepcopy(self.thermal_balance_arguments)
         electron_rate_solver = self.rate_matrix_solver.electron_rate_solver
         collisional_rates = electron_rate_solver.solve(
@@ -1211,7 +1227,30 @@ class PlasmaEquilibriumEvaluator:
                 self.fixed_rates.heating_rate_density
             )
         solver = deepcopy(self.thermal_balance_solver)
-        return solver.solve(**solver_arguments)
+        total_heating, fractional_heating = solver.solve(**solver_arguments)
+        thermal_budget = getattr(solver, "last_budget", None)
+        if thermal_budget is not None:
+            thermal_budget = thermal_budget.copy()
+            thermal_budget["electron_density"] = (
+                final_electron_distribution.number_density.to_value(u.cm**-3)
+            )
+            thermal_budget["electron_temperature"] = (
+                final_electron_distribution.temperature.to_value(u.K)
+            )
+            if self.time_explosion is not None:
+                thermal_budget["time_explosion"] = self.time_explosion.to_value(
+                    u.s
+                )
+                thermal_budget["adiabatic_cooling_estimate"] = (
+                    AdiabaticThermalRates()
+                    .solve(final_electron_distribution, self.time_explosion)
+                    .to_value(u.erg / (u.cm**3 * u.s))
+                )
+        return (
+            total_heating,
+            fractional_heating,
+            thermal_budget,
+        )
 
     def evaluate(
         self,
@@ -1234,7 +1273,7 @@ class PlasmaEquilibriumEvaluator:
         self._evaluation_count += 1
         evaluation_idx = self._evaluation_count
         evaluation_start_time = perf_counter()
-        logger.info(
+        logger.debug(
             "Starting plasma equilibrium evaluator call %d.", evaluation_idx
         )
         trial_density = pd.Series(
@@ -1259,7 +1298,7 @@ class PlasmaEquilibriumEvaluator:
             thermal_partition_function,
             thermal_level_boltzmann_factor,
         ) = self.calculate_continuum_coefficients(electron_temperature)
-        logger.info(
+        logger.debug(
             "Plasma equilibrium evaluator call %d finished continuum "
             "coefficients in %.3f s.",
             evaluation_idx,
@@ -1278,7 +1317,7 @@ class PlasmaEquilibriumEvaluator:
             thermal_partition_function,
             thermal_level_boltzmann_factor,
         )
-        logger.info(
+        logger.debug(
             "Plasma equilibrium evaluator call %d finished level populations "
             "in %.3f s.",
             evaluation_idx,
@@ -1290,7 +1329,7 @@ class PlasmaEquilibriumEvaluator:
             trial_electron_distribution,
             self.ion_population_arguments,
         )
-        logger.info(
+        logger.debug(
             "Plasma equilibrium evaluator call %d finished ion populations "
             "in %.3f s.",
             evaluation_idx,
@@ -1322,7 +1361,7 @@ class PlasmaEquilibriumEvaluator:
             level_state.thermal_level_boltzmann_factor,
             self.levels,
         )
-        logger.info(
+        logger.debug(
             "Plasma equilibrium evaluator call %d finished absolute and LTE "
             "populations in %.3f s.",
             evaluation_idx,
@@ -1345,20 +1384,22 @@ class PlasmaEquilibriumEvaluator:
         final_tau, final_escape_probabilities = self._calculate_final_opacities(
             absolute_levels, level_state
         )
-        logger.info(
+        logger.debug(
             "Plasma equilibrium evaluator call %d finished Sobolev opacities "
             "in %.3f s.",
             evaluation_idx,
             perf_counter() - stage_start_time,
         )
         stage_start_time = perf_counter()
-        total_heating, fractional_heating = self._calculate_heating(
-            final_electron_distribution,
-            absolute_levels,
-            ion_population,
-            level_state,
+        total_heating, fractional_heating, thermal_budget = (
+            self._calculate_heating(
+                final_electron_distribution,
+                absolute_levels,
+                ion_population,
+                level_state,
+            )
         )
-        logger.info(
+        logger.debug(
             "Plasma equilibrium evaluator call %d finished thermal balance "
             "in %.3f s.",
             evaluation_idx,
@@ -1368,16 +1409,18 @@ class PlasmaEquilibriumEvaluator:
         final_residual = self._calculate_final_residual(
             final_density, electron_temperature, absolute_levels, level_state
         )
-        logger.info(
+        logger.debug(
             "Plasma equilibrium evaluator call %d finished final level "
             "residual in %.3f s.",
             evaluation_idx,
             perf_counter() - stage_start_time,
         )
-        logger.info(
+        evaluation_elapsed = perf_counter() - evaluation_start_time
+        logger.log(
+            logging.INFO if evaluation_elapsed >= 10.0 else logging.DEBUG,
             "Finished plasma equilibrium evaluator call %d in %.3f s.",
             evaluation_idx,
-            perf_counter() - evaluation_start_time,
+            evaluation_elapsed,
         )
 
         return PlasmaEquilibriumEvaluation(
@@ -1408,4 +1451,5 @@ class PlasmaEquilibriumEvaluator:
             level_state.level_to_continuum_saha_factor,
             lte_ion_population,
             lte_level_population,
+            thermal_budget,
         )

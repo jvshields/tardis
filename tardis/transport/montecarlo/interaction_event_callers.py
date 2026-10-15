@@ -12,7 +12,6 @@ from tardis.transport.montecarlo import njit_dict_no_parallel
 from tardis.transport.montecarlo.interaction_events import (
     LineInteractionType,
     adiabatic_cooling,
-    bf_cooling,
     bound_free_emission,
     determine_bf_macro_activation_idx,
     free_free_emission,
@@ -34,7 +33,7 @@ def macro_atom_event(
     time_explosion: float,
     opacity_state: OpacityStateNumba | OpacityStateNumbaIIP,
     enable_full_relativity: bool,
-):
+) -> None:
     """
     Macroatom event handler - run the macroatom and handle the result
 
@@ -45,7 +44,10 @@ def macro_atom_event(
     time_explosion
     opacity_state
     """
-    if montecarlo_globals.CONTINUUM_PROCESSES_ENABLED:
+    if (
+        montecarlo_globals.CONTINUUM_PROCESSES_ENABLED
+        and opacity_state.absorbing_markov_probabilities.shape[0] > 0
+    ):
         transition_id, transition_type = macro_atom_interaction_iip(
             destination_level_idx, r_packet.current_shell_id, opacity_state
         )
@@ -141,7 +143,7 @@ def continuum_event(
     enable_full_relativity,
 ):
     """
-    continuum event handler - activate the macroatom and run the handler
+    Continuum event handler - activate the macroatom and run the handler
 
     Parameters
     ----------

@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Protocol
 
 import numpy as np
@@ -18,11 +17,12 @@ from tardis.energy_input.gamma_ray_transport import (
     calculate_ejecta_velocity_volume,
 )
 from tardis.io.atom_data.parse_atom_data import parse_atom_data
+from tardis.opacities.continuum.continuum_state import ContinuumOpacityState
+from tardis.opacities.continuum.macro_atom_state import ContinuumMacroAtomState
 from tardis.opacities.macro_atom.macroatom_solver import (
-    BoundBoundMacroAtomSolver,
+    ContinuumMacroAtomSolver,
 )
 from tardis.opacities.opacity_solver import OpacitySolver
-from tardis.opacities.opacity_state import OpacityState
 from tardis.opacities.tau_sobolev import (
     SOBOLEV_COEFFICIENT,
     calculate_beta_sobolev,
@@ -34,6 +34,7 @@ from tardis.plasma.equilibrium.evaluator import (
     calculate_lte_populations,
 )
 from tardis.plasma.equilibrium.inputs import (
+    ContinuumCoefficientState,
     FixedRateState,
     ShellNumberDensity,
     SobolevInputs,
@@ -41,11 +42,13 @@ from tardis.plasma.equilibrium.inputs import (
 from tardis.plasma.equilibrium.ion_populations import IonPopulationSolver
 from tardis.plasma.equilibrium.rate_matrix import (
     AnalyticIonRateMatrix,
+    EstimatedIonRateMatrix,
     RateMatrix,
 )
 from tardis.plasma.equilibrium.rates import (
     AnalyticPhotoionizationRateSolver,
     CollisionalIonizationRateSolver,
+    EstimatedPhotoionizationRateSolver,
     ThermalCollisionalRateSolver,
 )
 from tardis.plasma.equilibrium.rates.heating_cooling_rates import (
@@ -66,8 +69,9 @@ from tardis.plasma.nonthermal.pynonthermal_solver import (
 )
 from tardis.plasma.radiation_field import DilutePlanckianRadiationField
 from tardis.transport.montecarlo.configuration import montecarlo_globals
-from tardis.transport.montecarlo.modes.classic.solver import (
-    MCTransportSolverClassic,
+from tardis.transport.montecarlo.estimators import init_estimators_continuum
+from tardis.transport.montecarlo.modes.iip.solver import (
+    MCTransportSolverIIP,
 )
 from tardis.workflows.high_energy.deposition import (
     DepositionState,
@@ -483,7 +487,7 @@ class NonthermalHeliumPlasmaSolver:
 
 
 class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
-    """Classic optical workflow specialized for helium coupling."""
+    """Continuum optical workflow specialized for helium coupling."""
 
     plasma_coupling_solver: NonthermalHeliumPlasmaSolver
 
@@ -500,12 +504,10 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         continuum_interaction_species: Collection[str] = ("He I", "He II"),
         case_b_species: Collection[tuple[int, int]] = (),
     ) -> None:
-        """Initialize classic transport and helium equilibrium.
+        """Initialize continuum transport and helium equilibrium.
 
         The standard workflow initialization is reused for its simulation and
-        convergence state. The plasma retains helium photoionization data for
-        analytic equilibrium rates, while packet transport uses the classic
-        bound-bound macro-atom implementation.
+        convergence state. Continuum packets use direct macro-atom traversal.
 
         Parameters
         ----------
@@ -526,8 +528,7 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         csvy : bool, optional
             Read the ejecta model from CSVY.
         continuum_interaction_species : collection of str, optional
-            Species whose photoionization data are exposed to the equilibrium
-            evaluator. These transitions are not enabled in packet transport.
+            Species whose photoionization data enter continuum transport.
         case_b_species : collection of tuple[int, int], optional
             Species for which direct ground-state recombination is suppressed.
             The default is Case A for helium.
@@ -543,11 +544,10 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             csvy=csvy,
         )
         self.case_b_species = frozenset(case_b_species)
-        montecarlo_globals.CONTINUUM_PROCESSES_ENABLED = False
+        montecarlo_globals.CONTINUUM_PROCESSES_ENABLED = True
 
-        # ``StandardTARDISWorkflow`` prepares its atomic data for classic
-        # transport. Atomic data preparation is intentionally one-shot, so a
-        # fresh owner is required for the continuum selection below.
+        # Atomic data preparation is one-shot; continuum selection needs a
+        # fresh owner after standard workflow initialization.
         self.atom_data = parse_atom_data(configuration)
 
         radiation_field = DilutePlanckianRadiationField(
@@ -588,18 +588,46 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         self.opacity_solver = OpacitySolver(
             "macroatom", configuration.plasma.disable_line_scattering
         )
-        self.macro_atom_solver = BoundBoundMacroAtomSolver(
+        self.macro_atom_solver = ContinuumMacroAtomSolver(
             self.atom_data.levels,
             self.atom_data.lines,
+            self.atom_data.photoionization_data,
+            self.atom_data.ionization_data,
+            selected_continuum_transitions=np.asarray(
+                factory.continuum_interaction_species_multi_index.tolist()
+            ),
             line_interaction_type="macroatom",
+            nthreads=configuration.montecarlo.nthreads,
+            transition_mode="direct",
         )
         self.transport_state = None
-        self.transport_solver = MCTransportSolverClassic.from_config(
+        self.transport_solver = MCTransportSolverIIP.from_config(
             configuration,
             packet_source=self.simulation_state.packet_source,
             enable_virtual_packet_logging=enable_virtual_packet_logging,
         )
         self.transport_solver.line_interaction_type = "macroatom"
+        self._continuum_estimators = None
+        initial_state = self._current_plasma_state()
+        maximum_electron_density = (
+            self.plasma_solver.number_density.multiply(
+                self.plasma_solver.number_density.index.to_numpy(dtype=float),
+                axis=0,
+            )
+            .sum()
+            .to_numpy(dtype=float)
+        )
+        bootstrap_evaluator = self._build_helium_evaluator(
+            initial_state, None, (2, 0), maximum_electron_density
+        )
+        bootstrap_coefficients = (
+            bootstrap_evaluator.calculate_continuum_coefficients(
+                initial_state.electron_temperature
+            )
+        )
+        self._build_continuum_states(
+            bootstrap_coefficients[4], bootstrap_coefficients[1]
+        )
 
     def _current_plasma_state(self) -> CoupledPlasmaState:
         """Return an immutable copy of the current continuum plasma state."""
@@ -608,6 +636,140 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             np.asarray(self.plasma_solver.t_electrons, dtype=np.float64),
             self.plasma_solver.ion_number_density.copy(deep=True),
             self.plasma_solver.level_number_density.copy(deep=True),
+        )
+
+    def _build_continuum_states(
+        self,
+        continuum_coefficients: ContinuumCoefficientState,
+        level_to_continuum_saha_factor: pd.DataFrame,
+    ) -> None:
+        """Build continuum packet inputs from the accepted plasma state."""
+        plasma = self.plasma_solver
+        stimulated_cooling = None
+        if self._continuum_estimators is not None:
+            stimulated_cooling = pd.DataFrame(
+                self._continuum_estimators.stim_recomb_cooling_estimator,
+                index=plasma.level2continuum_idx.index,
+                columns=plasma.number_density.columns,
+            )
+        self.continuum_macro_atom_state = (
+            ContinuumMacroAtomState.from_equilibrium(
+                plasma.atomic_data,
+                plasma.lines,
+                plasma.photo_ion_cross_sections,
+                continuum_coefficients,
+                level_to_continuum_saha_factor,
+                plasma.ion_number_density,
+                plasma.level_number_density,
+                plasma.electron_densities,
+                plasma.t_electrons,
+                stimulated_cooling,
+            )
+        )
+        self.continuum_opacity_state = ContinuumOpacityState.from_equilibrium(
+            plasma.nu_i,
+            plasma.level2continuum_idx,
+            plasma.photo_ion_cross_sections,
+            plasma.photo_ion_idx,
+            plasma.ion_number_density,
+            plasma.level_number_density,
+            plasma.electron_densities,
+            plasma.t_electrons,
+            level_to_continuum_saha_factor,
+            self.continuum_macro_atom_state.radiative_recombination_rate,
+        )
+
+    def _capture_continuum_estimators(self) -> None:
+        """Normalize the fixed packet estimators for the next plasma solve."""
+        transport = self.transport_state
+        raw = transport.estimators_continuum
+        volume = transport.geometry_state_numba.volume
+        time = transport.time_of_simulation
+        normalization = 1.0 / (time * volume * const.h.cgs.value).value
+        target_intensity = (
+            self.simulation_state.dilution_factor
+            * self.simulation_state.t_radiative.value**4
+            * const.sigma_sb.cgs.value
+            / np.pi
+        )
+        estimated_intensity = transport.estimators_bulk.mean_intensity_total / (
+            4.0 * np.pi * time.value * volume
+        )
+        damping = np.divide(
+            target_intensity,
+            estimated_intensity,
+            out=np.ones_like(target_intensity),
+            where=estimated_intensity > 0.0,
+        )
+        estimator = init_estimators_continuum(
+            raw.photo_ion_estimator.shape,
+            len(self.plasma_solver.number_density.columns),
+        )
+        estimator.photo_ion_estimator = (
+            raw.photo_ion_estimator.copy()
+            * normalization
+            * damping
+            * const.h.cgs.value
+        )
+        estimator.photo_ion_estimator_statistics = (
+            raw.photo_ion_estimator_statistics.copy()
+        )
+        estimator.stim_recomb_estimator = (
+            raw.stim_recomb_estimator.copy()
+            * normalization
+            * damping
+            * const.h.cgs.value
+        )
+        estimator.bf_heating_estimator = (
+            raw.bf_heating_estimator.copy()
+            * normalization
+            * const.h.cgs.value
+            * damping
+        )
+        estimator.stim_recomb_cooling_estimator = (
+            raw.stim_recomb_cooling_estimator.copy()
+            * normalization
+            * const.h.cgs.value
+            * damping
+        )
+        ion_population = self.plasma_solver.ion_number_density
+        charge_squared = np.square(
+            ion_population.index.get_level_values("ion_number").to_numpy()
+        )
+        free_free_denominator = (
+            self.plasma_solver.electron_densities.to_numpy()
+            * ion_population.multiply(charge_squared, axis=0).sum().to_numpy()
+        )
+        free_free_factor = np.divide(
+            np.sqrt(self.plasma_solver.t_electrons),
+            free_free_denominator,
+            out=np.zeros_like(free_free_denominator),
+            where=free_free_denominator > 0.0,
+        )
+        estimator.ff_heating_estimator = (
+            raw.ff_heating_estimator.copy()
+            * free_free_factor
+            * normalization
+            * const.h.cgs.value
+            * damping
+        )
+        self._continuum_estimators = estimator
+
+        j_blues = self.transport_solver.radfield_prop_solver.estimate_jblues(
+            transport.estimators_line.mean_intensity_blueward,
+            self.simulation_state.radiation_field_state,
+            transport.time_explosion,
+            time,
+            volume,
+            transport.opacity_state_numba.line_list_nu,
+            detailed_optical_window=True,
+        )
+        self.plasma_solver.update(
+            j_blues=pd.DataFrame(
+                j_blues * damping,
+                index=self.plasma_solver.lines.index,
+                columns=self.plasma_solver.number_density.columns,
+            )
         )
 
     def _update_sobolev_state(self) -> None:
@@ -627,7 +789,7 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         bound_bound_species_filter: tuple[int, int] | None,
         maximum_electron_density: npt.NDArray[np.float64],
     ) -> PlasmaEquilibriumEvaluator:
-        """Build one helium evaluator with analytic bound-free rates."""
+        """Build one helium evaluator from analytic or packet rates."""
         plasma = self.plasma_solver
         shell_columns = plasma_state.ion_number_density.columns
         shell_positions = plasma.number_density.columns.get_indexer(
@@ -739,11 +901,26 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             equilibrium_levels,
         )
 
-        ion_rate_matrix = AnalyticIonRateMatrix(
-            AnalyticPhotoionizationRateSolver(photoionization_data),
-            CollisionalIonizationRateSolver(photoionization_data),
-            fixed_rates=fixed_rates,
-        )
+        estimators = self._continuum_estimators
+        if estimators is None:
+            ion_rate_matrix = AnalyticIonRateMatrix(
+                AnalyticPhotoionizationRateSolver(photoionization_data),
+                CollisionalIonizationRateSolver(photoionization_data),
+                fixed_rates=fixed_rates,
+            )
+        else:
+            ion_rate_matrix = EstimatedIonRateMatrix(
+                EstimatedPhotoionizationRateSolver(
+                    photoionization_data,
+                    level2continuum_edge_idx,
+                    estimators,
+                    1.0 * u.s,
+                    1.0 * u.cm**3,
+                ),
+                CollisionalIonizationRateSolver(photoionization_data),
+                plasma.phi.loc[:, shell_columns],
+                fixed_rates=fixed_rates,
+            )
         ion_population_solver = IonPopulationSolver(ion_rate_matrix)
 
         collisional_index = rate_matrix_solver.electron_rate_solver.all_collisional_strengths_index
@@ -784,15 +961,37 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             ),
         )
         thermal_balance_arguments = {
-            "free_free_heating_estimator": pd.Series(0.0, index=shell_columns),
-            "radiation_field": radiation_field,
+            "free_free_heating_estimator": (
+                pd.Series(0.0, index=shell_columns)
+                if estimators is None
+                else pd.Series(
+                    estimators.ff_heating_estimator, index=shell_columns
+                )
+            ),
         }
+        if estimators is None:
+            thermal_balance_arguments["radiation_field"] = radiation_field
+        else:
+            thermal_balance_arguments["bound_free_heating_estimator"] = (
+                pd.DataFrame(
+                    estimators.bf_heating_estimator,
+                    index=level2continuum_edge_idx.index,
+                    columns=shell_columns,
+                )
+            )
+            thermal_balance_arguments["stimulated_recombination_estimator"] = (
+                pd.DataFrame(
+                    estimators.stim_recomb_cooling_estimator,
+                    index=level2continuum_edge_idx.index,
+                    columns=shell_columns,
+                )
+            )
         return PlasmaEquilibriumEvaluator(
             photoionization_data,
             level2continuum_edge_idx,
-            None,
-            None,
-            None,
+            estimators,
+            None if estimators is None else 1.0 * u.s,
+            None if estimators is None else 1.0 * u.cm**3,
             equilibrium_levels,
             plasma.ionization_data,
             rate_matrix_solver,
@@ -809,7 +1008,9 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             maximum_electron_density,
             ion_population_solver=ion_population_solver,
             ion_population_arguments={
-                "radiation_field": radiation_field,
+                "radiation_field": (
+                    radiation_field if estimators is None else None
+                ),
                 "elemental_number_density": selected_number_density,
                 "lte_level_population": lte_level_population,
                 "lte_ion_population": lte_ion_population,
@@ -823,9 +1024,10 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             },
             thermal_balance_solver=thermal_balance_solver,
             thermal_balance_arguments=thermal_balance_arguments,
-            radiation_field=radiation_field,
+            radiation_field=(radiation_field if estimators is None else None),
             fixed_rates=fixed_rates,
             case_b_species=self.case_b_species,
+            time_explosion=plasma.time_explosion,
         )
 
     def build_helium_evaluator(
@@ -834,7 +1036,7 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         fixed_rates: FixedRateState,
         bound_bound_species_filter: tuple[int, int] | None,
     ) -> PlasmaEquilibriumEvaluator:
-        """Build an analytic bound-free evaluator for one Picard iteration."""
+        """Build a fixed estimator evaluator for one Picard iteration."""
         maximum_electron_density = (
             self.plasma_solver.number_density.multiply(
                 self.plasma_solver.number_density.index.to_numpy(dtype=float),
@@ -851,13 +1053,19 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         )
 
     def solve_plasma(self, estimated_radfield_properties: object) -> None:
-        """Update classic radiation estimators, then converge helium."""
+        """Freeze continuum estimators, then converge helium."""
         super().solve_plasma(estimated_radfield_properties)
-        self.plasma_coupling_solver.solve(self)
+        self._capture_continuum_estimators()
+        result = self.plasma_coupling_solver.solve(self)
+        evaluation = result.equilibrium_solution.evaluation
+        self._build_continuum_states(
+            evaluation.continuum_coefficients,
+            evaluation.level_to_continuum_saha_factor,
+        )
         self._update_sobolev_state()
 
     def solve_opacity(self) -> dict[str, object]:
-        """Solve line opacity and classic bound-bound macro-atom states."""
+        """Solve line and continuum opacity and direct macro-atom states."""
         self._update_sobolev_state()
         tau_sobolev = self._tau_sobolev
         beta_sobolev = self._beta_sobolev
@@ -872,18 +1080,18 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
                 index=beta_sobolev.index,
                 columns=beta_sobolev.columns,
             )
-        opacity_state = OpacityState(
-            self.plasma_solver.electron_densities,
-            np.asarray(self.plasma_solver.t_electrons, dtype=np.float64),
-            self.atom_data.lines.nu,
-            tau_sobolev,
-            beta_sobolev,
-            continuum_state=None,
+        opacity_state = self.opacity_solver.solve(
+            self.plasma_solver,
+            self.continuum_opacity_state,
+            tau_sobolev=tau_sobolev,
+            beta_sobolev=beta_sobolev,
         )
         macro_atom_state = self.macro_atom_solver.solve(
             self.plasma_solver.j_blues,
             opacity_state.beta_sobolev,
             self.plasma_solver.stimulated_emission_factor,
+            self.continuum_macro_atom_state,
+            self.plasma_solver.electron_densities,
         )
         return {
             "opacity_state": opacity_state,
@@ -895,30 +1103,23 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         opacity_states: dict[str, object],
         no_of_real_packets: int,
         no_of_virtual_packets: int = 0,
-    ) -> npt.NDArray[np.float64]:
-        """Run classic Monte Carlo transport."""
-        classic_transport_plasma = SimpleNamespace(
-            continuum_interaction_species=pd.MultiIndex.from_tuples(
-                [], names=["atomic_number", "ion_number"]
-            )
-        )
+    ) -> None:
+        """Run continuum Monte Carlo transport and collect estimators."""
         self.transport_state = self.transport_solver.initialize_transport_state(
             self.simulation_state,
             opacity_states["opacity_state"],
             opacity_states["macro_atom_state"],
-            classic_transport_plasma,
             no_of_real_packets,
             no_of_virtual_packets=no_of_virtual_packets,
             iteration=self.completed_iterations,
         )
-        virtual_packet_energies = self.transport_solver.run(
+        self.transport_solver.run(
             self.transport_state,
             show_progress_bars=self.show_progress_bars,
         )
         output_energy = self.transport_state.packet_collection.output_energies
         if np.sum(output_energy < 0) == len(output_energy):
             logger.critical("No r-packet escaped through the outer boundary.")
-        return virtual_packet_energies
 
 
 class NonthermalHeliumWorkflow:

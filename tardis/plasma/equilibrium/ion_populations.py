@@ -768,14 +768,14 @@ class IonPopulationSolver:
         solution_population_indices: npt.NDArray[np.intp] | None = None
 
         for iteration in range(self.max_solver_iterations):
-            logger.info("Ion solver iteration %d", iteration + 1)
+            logger.debug("Ion solver iteration %d", iteration + 1)
             self._charge_root_diagnostics = {}
             prepare_rate_matrix = getattr(
                 self.rate_matrix_solver, "prepare", None
             )
             if prepare_rate_matrix is not None:
                 rate_matrix_mode = "prepared"
-                logger.info(
+                logger.debug(
                     "Ion solver iteration %d starting ion rate-matrix "
                     "preparation.",
                     iteration + 1,
@@ -790,22 +790,26 @@ class IonPopulationSolver:
                     level_to_continuum_saha_factor,
                     lte_ionization_factor,
                 )
-                logger.info(
+                preparation_elapsed = perf_counter() - preparation_start_time
+                logger.log(
+                    logging.INFO
+                    if preparation_elapsed >= 10.0
+                    else logging.DEBUG,
                     "Ion solver iteration %d finished ion rate-matrix "
                     "preparation in %.3f s.",
                     iteration + 1,
-                    perf_counter() - preparation_start_time,
+                    preparation_elapsed,
                 )
             else:
                 rate_matrix_mode = "direct"
-                logger.info(
+                logger.debug(
                     "Ion solver iteration %d uses direct ion rate-matrix "
                     "construction (%s).",
                     iteration + 1,
                     type(self.rate_matrix_solver).__name__,
                 )
             unconverged_shell_indices = np.flatnonzero(~converged_shells)
-            logger.info(
+            logger.debug(
                 "Ion solver iteration %d starting %d shell charge solves "
                 "(rate-matrix mode=%s).",
                 iteration + 1,
@@ -829,15 +833,17 @@ class IonPopulationSolver:
                     elemental_number_density,
                     lte_ionization_factor=lte_ionization_factor,
                 )
-            logger.info(
+            charge_solve_elapsed = perf_counter() - shell_charge_start_time
+            logger.log(
+                logging.INFO if charge_solve_elapsed >= 10.0 else logging.DEBUG,
                 "Ion solver iteration %d finished %d shell charge solves in "
                 "%.3f s (rate-matrix mode=%s).",
                 iteration + 1,
                 len(unconverged_shell_indices),
-                perf_counter() - shell_charge_start_time,
+                charge_solve_elapsed,
                 rate_matrix_mode,
             )
-            logger.info(
+            logger.debug(
                 "Ion solver iteration %d starting full charge-balance "
                 "reconstruction.",
                 iteration + 1,
@@ -860,7 +866,7 @@ class IonPopulationSolver:
                     lte_ionization_factor=lte_ionization_factor,
                 )
             )
-            logger.info(
+            logger.debug(
                 "Ion solver iteration %d finished full charge-balance "
                 "reconstruction in %.3f s.",
                 iteration + 1,
@@ -972,7 +978,7 @@ class IonPopulationSolver:
                 blocker = "none"
 
             converged_shells |= charge_converged & population_converged
-            logger.info(
+            logger.debug(
                 "Ion solver iteration %d: %d/%d shells unconverged; "
                 "population-failing shells=%d, charge-failing shells=%d, "
                 "failures of both=%d; maximum ion-stage relative residual "
@@ -1015,7 +1021,7 @@ class IonPopulationSolver:
                 final_charge_residual = charge_residual[
                     active_shell_indices[charge_position]
                 ]
-                logger.info(
+                logger.debug(
                     "Ion solver iteration %d charge-root consistency in shell "
                     "%s: local terminal residual=%.3e, final residual=%.3e, "
                     "absolute difference=%.3e; Brent converged=%s, "
@@ -1031,7 +1037,7 @@ class IonPopulationSolver:
                     root_flag,
                 )
             if np.all(converged_shells):
-                logger.info(
+                logger.debug(
                     "Ion population solver converged after %d iterations.",
                     iteration + 1,
                 )

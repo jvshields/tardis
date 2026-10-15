@@ -451,11 +451,11 @@ class TypeIIPWorkflow:
             self.luminosity_nu_end,
         )
 
-        logger.info(
-            "\n\tLuminosity emitted   = %.3e\n\tLuminosity absorbed  = %.3e\n",
-            emitted_luminosity,
-            absorbed_luminosity,
-        )
+        # logger.info(
+        #     "\n\tLuminosity emitted   = %.3e\n\tLuminosity absorbed  = %.3e\n",
+        #     emitted_luminosity,
+        #     absorbed_luminosity,
+        # )
 
         self.workflow_logger.log_plasma_state(
             self.simulation_state.t_radiative,

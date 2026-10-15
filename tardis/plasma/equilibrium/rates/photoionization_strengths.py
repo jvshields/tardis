@@ -67,7 +67,7 @@ class SpontaneousRecombinationCoeffSolver:
         """
         return np.exp(-self.nu[np.newaxis].T / electron_temperature * (H / K_B))
 
-    def solve(self, electron_temperature):
+    def solve(self, electron_temperature: u.Quantity) -> pd.DataFrame:
         """
         Calculate the spontaneous recombination rate coefficient.
 
@@ -111,8 +111,9 @@ class SpontaneousRecombinationCoeffSolver:
             index=self.photoionization_index,
         )
 
-        # Lymann continuum handling
-        spontaneous_recombination_rate_coeff_df.loc[(1, 0, 0)] = 0.0
+        # Suppress the Lyman continuum only when the input contains it.
+        if (1, 0, 0) in spontaneous_recombination_rate_coeff_df.index:
+            spontaneous_recombination_rate_coeff_df.loc[(1, 0, 0)] = 0.0
 
         return spontaneous_recombination_rate_coeff_df
 

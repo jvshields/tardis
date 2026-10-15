@@ -10,6 +10,7 @@ from numpy.testing import (
 )
 from scipy.optimize import brentq
 
+from tardis import constants as const
 from tardis.io.atom_data import AtomData
 from tardis.plasma.electron_energy_distribution import (
     ThermalElectronEnergyDistribution,
@@ -567,6 +568,84 @@ def test_collisional_ionization_thermal_rates_solve(
     )
 
 
+def test_collisional_ionization_thermal_rates_use_matching_upper_ions() -> None:
+    """He I and He II cooling/heating use their own continuum stages."""
+    level_index = pd.MultiIndex.from_tuples(
+        [(2, 0, 0), (2, 0, 1), (2, 1, 0)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    ion_index = pd.MultiIndex.from_tuples(
+        [(2, 0), (2, 1), (2, 2)],
+        names=["atomic_number", "ion_number"],
+    )
+    shell_index = pd.Index([0, 1])
+    frequencies = np.array([1.0e15, 1.5e15, 2.0e15])
+    coefficients = np.array(
+        [[1.0e-8, 2.0e-8], [3.0e-8, 4.0e-8], [5.0e-8, 6.0e-8]]
+    )
+    upper_ion_populations = np.array([[5.0, 7.0], [5.0, 7.0], [11.0, 13.0]])
+    level_ratios = np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
+    lower_level_populations = np.array(
+        [[17.0, 19.0], [23.0, 29.0], [31.0, 37.0]]
+    )
+    electron_densities = np.array([2.0, 3.0])
+
+    heating, cooling = CollisionalIonizationThermalRates(
+        pd.DataFrame({"nu": frequencies}, index=level_index)
+    ).solve(
+        electron_densities / u.cm**3,
+        pd.DataFrame(
+            [[41.0, 43.0], [5.0, 7.0], [11.0, 13.0]],
+            index=ion_index,
+            columns=shell_index,
+        ),
+        pd.DataFrame(
+            lower_level_populations, index=level_index, columns=shell_index
+        ),
+        pd.DataFrame(coefficients, index=level_index, columns=shell_index),
+        pd.DataFrame(level_ratios, index=level_index, columns=shell_index),
+    )
+
+    level_energy = frequencies[:, np.newaxis] * const.h.cgs.value
+    expected_heating = electron_densities**2 * (
+        upper_ion_populations * level_ratios * coefficients * level_energy
+    ).sum(axis=0)
+    expected_cooling = electron_densities * (
+        lower_level_populations * coefficients * level_energy
+    ).sum(axis=0)
+    assert_allclose(heating.to_numpy(), expected_heating, rtol=1e-14)
+    assert_allclose(cooling.to_numpy(), expected_cooling, rtol=1e-14)
+
+
+def test_collisional_ionization_thermal_rates_skip_absent_upper_ion() -> None:
+    """An absent H II stage contributes no collisional-recombination heat."""
+    level_index = pd.MultiIndex.from_tuples(
+        [(1, 0, 0), (2, 0, 0)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    ion_index = pd.MultiIndex.from_tuples(
+        [(2, 0), (2, 1)], names=["atomic_number", "ion_number"]
+    )
+    helium_level_index = level_index[1:]
+    heating, cooling = CollisionalIonizationThermalRates(
+        pd.DataFrame({"nu": [1.0e15, 2.0e15]}, index=level_index)
+    ).solve(
+        np.array([2.0]) / u.cm**3,
+        pd.DataFrame([[3.0], [5.0]], index=ion_index, columns=[0]),
+        pd.DataFrame([[0.0], [7.0]], index=level_index, columns=[0]),
+        pd.DataFrame([[1.0e-8], [2.0e-8]], index=level_index, columns=[0]),
+        pd.DataFrame([[0.1]], index=helium_level_index, columns=[0]),
+    )
+
+    helium_level_energy = 2.0e15 * const.h.cgs.value
+    assert_allclose(
+        heating.to_numpy(), [2.0**2 * 5.0 * 0.1 * 2.0e-8 * helium_level_energy]
+    )
+    assert_allclose(
+        cooling.to_numpy(), [2.0 * 7.0 * 2.0e-8 * helium_level_energy]
+    )
+
+
 @pytest.mark.parametrize(
     "heating_rate, cooling_rate",
     [
@@ -910,12 +989,13 @@ def test_thermal_balance_reconstructs_net_and_fractional_rates(
         photoionization_data
     )
     collisional_bound_solver = CollisionalBoundThermalRates(ctardis_lines)
-    total_heating, fractional_heating = ThermalBalanceSolver(
+    thermal_balance_solver = ThermalBalanceSolver(
         bound_free_solver,
         free_free_solver,
         collisional_ionization_solver,
         collisional_bound_solver,
-    ).solve(
+    )
+    total_heating, fractional_heating = thermal_balance_solver.solve(
         thermal_electron_distribution,
         level_population,
         ion_population,
@@ -992,14 +1072,32 @@ def test_thermal_balance_reconstructs_net_and_fractional_rates(
     )
     assert np.all(net_residual <= 1e-12 * thermal_scale)
     assert np.all(fractional_residual <= 1e-12)
+    budget = thermal_balance_solver.last_budget
+    assert budget is not None
+    assert_allclose(budget["total_heating"], heating)
+    assert_allclose(budget["total_cooling"], cooling)
+    assert_allclose(budget["bound_free_heating"], bound_free[0])
+    assert_allclose(budget["free_bound_cooling"], bound_free[1])
+    assert_allclose(budget["free_free_heating"], free_free[0])
+    assert_allclose(budget["free_free_cooling"], free_free[1])
+    assert_allclose(
+        budget["collisional_ionization_heating"], collisional_ionization[0]
+    )
+    assert_allclose(
+        budget["collisional_ionization_cooling"], collisional_ionization[1]
+    )
+    assert_allclose(budget["collisional_bound_heating"], collisional_bound[0])
+    assert_allclose(budget["collisional_bound_cooling"], collisional_bound[1])
+    assert_allclose(budget["nonthermal_heating"], 0.0)
 
     nonthermal_heating = pd.Series(1.0, index=level_population.columns)
-    fixed_total, fixed_fractional = ThermalBalanceSolver(
+    fixed_thermal_balance_solver = ThermalBalanceSolver(
         bound_free_solver,
         free_free_solver,
         collisional_ionization_solver,
         collisional_bound_solver,
-    ).solve(
+    )
+    fixed_total, fixed_fractional = fixed_thermal_balance_solver.solve(
         thermal_electron_distribution,
         level_population,
         ion_population,
@@ -1014,6 +1112,10 @@ def test_thermal_balance_reconstructs_net_and_fractional_rates(
         nonthermal_heating,
     )
     assert_allclose(fixed_total - total_heating, nonthermal_heating)
+    assert_allclose(
+        fixed_thermal_balance_solver.last_budget["nonthermal_heating"],
+        nonthermal_heating,
+    )
     assert_allclose(
         fixed_fractional - fractional_heating,
         nonthermal_heating / cooling,

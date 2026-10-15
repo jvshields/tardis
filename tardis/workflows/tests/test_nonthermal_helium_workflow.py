@@ -12,6 +12,7 @@ from tardis.plasma.equilibrium.solver import PlasmaEquilibriumSolution
 from tardis.plasma.nonthermal.pynonthermal_solver import (
     NonthermalPlasmaState,
 )
+from tardis.transport.montecarlo.estimators import init_estimators_continuum
 from tardis.workflows.high_energy.deposition import DepositionState
 from tardis.workflows.nonthermal_helium_workflow import (
     CoupledPlasmaState,
@@ -314,7 +315,8 @@ def test_nonthermal_solver_updates_all_shells() -> None:
         result.plasma_state.electron_density, np.full(55, 4.0e8)
     )
     npt.assert_array_equal(
-        result.plasma_state.electron_temperature, np.full(55, 8000.0)
+        result.plasma_state.electron_temperature,
+        np.full(55, 8000.0),
     )
     pdt.assert_frame_equal(
         result.plasma_state.ion_number_density,
@@ -435,20 +437,20 @@ def test_composed_workflow_rejects_mismatched_velocity_grid() -> None:
         workflow.run()
 
 
-def test_specialized_optical_workflow_uses_bound_bound_macro_atom() -> None:
-    """Keep continuum state out of the classic macro-atom opacity solve.
+def test_specialized_optical_workflow_uses_continuum_macro_atom() -> None:
+    """Pass accepted continuum rates into macro-atom opacity construction.
 
     Claim
     -----
-    Nonthermal helium coupling does not require continuum packet processes.
+    The next packet iteration uses the accepted continuum state.
 
     Regime
     ------
-    One deterministic opacity update with a bound-bound macro-atom solver.
+    One deterministic opacity update with a continuum macro-atom solver.
 
     Verification
     ------------
-    The macro-atom solver receives only the three classic bound-bound inputs.
+    The macro-atom solver receives continuum rates and electron density.
     """
     macro_atom_arguments = []
     workflow = object.__new__(NonthermalHeliumOpticalWorkflow)
@@ -464,7 +466,18 @@ def test_specialized_optical_workflow_uses_bound_bound_macro_atom() -> None:
             index=pd.Index([0]),
         )
     )
-    workflow.opacity_solver = SimpleNamespace(disable_line_scattering=False)
+    continuum_opacity = object()
+    continuum_rates = object()
+    opacity_arguments = []
+    workflow.continuum_opacity_state = continuum_opacity
+    workflow.continuum_macro_atom_state = continuum_rates
+    workflow.opacity_solver = SimpleNamespace(
+        disable_line_scattering=False,
+        solve=lambda *args, **kwargs: (
+            opacity_arguments.append((args, kwargs)),
+            SimpleNamespace(beta_sobolev=pd.DataFrame([[1.0]])),
+        )[1],
+    )
     workflow._update_sobolev_state = lambda: None
     workflow._tau_sobolev = pd.DataFrame([[1.0]])
     workflow._beta_sobolev = pd.DataFrame([[1.0]])
@@ -474,11 +487,15 @@ def test_specialized_optical_workflow_uses_bound_bound_macro_atom() -> None:
 
     workflow.solve_opacity()
 
-    assert len(macro_atom_arguments[0]) == 3
+    assert opacity_arguments[0][0][1] is continuum_opacity
+    assert macro_atom_arguments[0][3] is continuum_rates
+    assert (
+        macro_atom_arguments[0][4] is workflow.plasma_solver.electron_densities
+    )
 
 
-def test_specialized_optical_workflow_disables_continuum_transport() -> None:
-    """Present an empty continuum selection to classic packet transport."""
+def test_specialized_optical_workflow_enables_continuum_transport() -> None:
+    """Provide the IIP transport with continuum opacity and macro-atom data."""
     initialized_with = []
     transport_state = SimpleNamespace(
         packet_collection=SimpleNamespace(output_energies=np.array([1.0]))
@@ -489,25 +506,94 @@ def test_specialized_optical_workflow_disables_continuum_transport() -> None:
     workflow.show_progress_bars = False
     workflow.transport_solver = SimpleNamespace(
         initialize_transport_state=lambda *args, **kwargs: (
-            initialized_with.append(args[3]),
+            initialized_with.append(args),
             transport_state,
         )[1],
         run=lambda *args, **kwargs: np.array([2.0]),
     )
 
+    opacity_state = object()
+    macro_atom_state = object()
     virtual_packet_energies = workflow.solve_montecarlo(
-        {"opacity_state": object(), "macro_atom_state": object()},
+        {"opacity_state": opacity_state, "macro_atom_state": macro_atom_state},
         no_of_real_packets=1,
     )
 
-    assert initialized_with[0].continuum_interaction_species.empty
-    npt.assert_array_equal(virtual_packet_energies, [2.0])
+    assert initialized_with[0][1] is opacity_state
+    assert initialized_with[0][2] is macro_atom_state
+    assert virtual_packet_energies is None
 
 
-def test_specialized_optical_workflow_couples_after_classic_plasma_update(
+def test_continuum_estimators_remain_finite_in_unvisited_shells() -> None:
+    """An unvisited shell keeps zero packet rates without NaN damping.
+
+    Claim
+    -----
+    Sparse Monte Carlo estimators do not contaminate the plasma rates.
+
+    Regime
+    ------
+    Two shells with radiation-field paths only in the first shell.
+
+    Verification
+    ------------
+    Every normalized continuum estimator and line intensity is finite, and
+    the unvisited shell's continuum rate remains exactly zero.
+    """
+    workflow = object.__new__(NonthermalHeliumOpticalWorkflow)
+    shell_columns = pd.RangeIndex(2)
+    raw = init_estimators_continuum((1, 2), 2)
+    raw.photo_ion_estimator[0, 0] = 2.0
+    workflow.transport_state = SimpleNamespace(
+        estimators_continuum=raw,
+        geometry_state_numba=SimpleNamespace(volume=np.ones(2)),
+        time_of_simulation=1.0 * u.s,
+        time_explosion=1.0 * u.s,
+        estimators_bulk=SimpleNamespace(
+            mean_intensity_total=np.array([1.0, 0.0])
+        ),
+        estimators_line=SimpleNamespace(mean_intensity_blueward=object()),
+        opacity_state_numba=SimpleNamespace(line_list_nu=np.array([1.0])),
+    )
+    workflow.simulation_state = SimpleNamespace(
+        dilution_factor=np.ones(2),
+        t_radiative=np.array([6000.0, 6000.0]) * u.K,
+        radiation_field_state=object(),
+    )
+    updated = []
+    workflow.plasma_solver = SimpleNamespace(
+        number_density=pd.DataFrame({0: [1.0], 1: [1.0]}),
+        ion_number_density=pd.DataFrame(
+            [[1.0, 1.0]],
+            index=pd.MultiIndex.from_tuples(
+                [(2, 1)], names=["atomic_number", "ion_number"]
+            ),
+            columns=shell_columns,
+        ),
+        electron_densities=pd.Series([1.0, 1.0]),
+        t_electrons=np.array([1.0, 1.0]),
+        lines=pd.DataFrame(index=pd.Index([0])),
+        update=lambda **kwargs: updated.append(kwargs),
+    )
+    workflow.transport_solver = SimpleNamespace(
+        radfield_prop_solver=SimpleNamespace(
+            estimate_jblues=lambda *args, **kwargs: np.array([[1.0, 0.0]])
+        )
+    )
+
+    workflow._capture_continuum_estimators()
+
+    normalized = workflow._continuum_estimators
+    assert np.isfinite(normalized.photo_ion_estimator).all()
+    assert np.isfinite(normalized.ff_heating_estimator).all()
+    assert np.isfinite(updated[0]["j_blues"].to_numpy()).all()
+    assert normalized.photo_ion_estimator[0, 1] == 0.0
+
+
+def test_specialized_optical_workflow_couples_after_estimator_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Converge nonthermal helium after the classic radiation-field update."""
+    """Build next continuum state after accepting coupled helium plasma."""
     call_order = []
     workflow = object.__new__(NonthermalHeliumOpticalWorkflow)
     estimated_radfield_properties = object()
@@ -519,10 +605,25 @@ def test_specialized_optical_workflow_couples_after_classic_plasma_update(
         ),
     )
     workflow._update_sobolev_state = lambda: call_order.append(("sobolev",))
+    workflow._capture_continuum_estimators = lambda: call_order.append(
+        ("estimators",)
+    )
+    workflow._build_continuum_states = lambda *args: call_order.append(
+        ("continuum", *args)
+    )
+    coefficients = object()
+    saha_factor = object()
     workflow.plasma_coupling_solver = SimpleNamespace(
         solve=lambda owner: (
             call_order.append(("nonthermal", owner)),
-            object(),
+            SimpleNamespace(
+                equilibrium_solution=SimpleNamespace(
+                    evaluation=SimpleNamespace(
+                        continuum_coefficients=coefficients,
+                        level_to_continuum_saha_factor=saha_factor,
+                    )
+                )
+            ),
         )[1]
     )
 
@@ -530,7 +631,10 @@ def test_specialized_optical_workflow_couples_after_classic_plasma_update(
 
     assert [call[0] for call in call_order] == [
         "classic",
+        "estimators",
         "nonthermal",
+        "continuum",
         "sobolev",
     ]
     assert call_order[0][2] is estimated_radfield_properties
+    assert call_order[3][1:] == (coefficients, saha_factor)

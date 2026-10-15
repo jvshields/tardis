@@ -10,7 +10,7 @@ from typing import Protocol
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from scipy.optimize import least_squares
+from scipy.optimize import OptimizeResult, least_squares
 from scipy.sparse import block_diag
 
 logger = logging.getLogger(__name__)
@@ -126,15 +126,18 @@ class PlasmaEquilibriumSolver:
             format="csr",
         )
         residual_evaluation_count = 0
+        previous_optimizer_candidate = initial_guess.copy()
+        previous_optimizer_cost = np.nan
+        thermal_budgets: dict[bytes, pd.DataFrame] = {}
 
         def residual(
             candidate: npt.NDArray[np.float64],
         ) -> npt.NDArray[np.float64]:
-            nonlocal residual_evaluation_count
+            nonlocal residual_evaluation_count, previous_optimizer_cost
             residual_evaluation_count += 1
             evaluation_idx = residual_evaluation_count
             evaluation_start_time = perf_counter()
-            logger.info(
+            logger.debug(
                 "Starting plasma equilibrium residual evaluation %d.",
                 evaluation_idx,
             )
@@ -151,20 +154,137 @@ class PlasmaEquilibriumSolver:
                     "The evaluator must provide electron and thermal residuals."
                 )
             result = np.empty_like(candidate)
-            result[::2] = np.asarray(
+            electron_residual = np.asarray(
                 evaluation.electron_residual, dtype=np.float64
             )
-            result[1::2] = np.asarray(
+            thermal_residual = np.asarray(
                 evaluation.fractional_heating, dtype=np.float64
             )
-            logger.info(
+            result[::2] = electron_residual
+            result[1::2] = thermal_residual
+            thermal_budget = getattr(evaluation, "thermal_budget", None)
+            if thermal_budget is not None:
+                thermal_budgets[candidate.tobytes()] = thermal_budget
+            charge_shell_idx = int(np.argmax(np.abs(electron_residual)))
+            thermal_shell_idx = int(np.argmax(np.abs(thermal_residual)))
+            trial_cost = float(0.5 * np.dot(result, result))
+            if evaluation_idx == 1:
+                previous_optimizer_cost = trial_cost
+            logger.debug(
                 "Finished plasma equilibrium residual evaluation %d in %.3f "
-                "s (maximum absolute residual %.3e).",
+                "s (electron-density max %.6e in shell %s (signed %.6e, trial n_e "
+                "%.6e cm^-3, n_e/n_e,max %.6e); thermal max %.6e in "
+                "shell %s (signed %.6e, trial T_e %.6e K, T_e/T_rad %.6e); "
+                "trial cost %.6e).",
                 evaluation_idx,
                 perf_counter() - evaluation_start_time,
-                float(np.max(np.abs(result))),
+                abs(electron_residual[charge_shell_idx]),
+                evaluation.electron_residual.index[charge_shell_idx],
+                electron_residual[charge_shell_idx],
+                maximum_density[charge_shell_idx]
+                * candidate[2 * charge_shell_idx],
+                candidate[2 * charge_shell_idx],
+                abs(thermal_residual[thermal_shell_idx]),
+                evaluation.fractional_heating.index[thermal_shell_idx],
+                thermal_residual[thermal_shell_idx],
+                radiation_temperature[thermal_shell_idx]
+                * candidate[2 * thermal_shell_idx + 1],
+                candidate[2 * thermal_shell_idx + 1],
+                trial_cost,
             )
             return result
+
+        def report_optimizer_step(intermediate_result: OptimizeResult) -> None:
+            nonlocal previous_optimizer_candidate, previous_optimizer_cost
+            accepted_residual = intermediate_result.fun
+            step_norm = float(
+                np.max(
+                    np.abs(intermediate_result.x - previous_optimizer_candidate)
+                )
+            )
+            cost_reduction = float(
+                previous_optimizer_cost - intermediate_result.cost
+            )
+            charge_shell_idx = int(np.argmax(np.abs(accepted_residual[::2])))
+            thermal_shell_idx = int(np.argmax(np.abs(accepted_residual[1::2])))
+            thermal_shell = level_seed.columns[thermal_shell_idx]
+            budget = thermal_budgets.get(intermediate_result.x.tobytes())
+            thermal_budgets.clear()
+            budget_report = ""
+            if budget is not None:
+                shell_budget = budget.loc[thermal_shell]
+                budget_terms = (
+                    ("total_heating", "H"),
+                    ("total_cooling", "C"),
+                    ("bound_free_heating", "bound-free H"),
+                    ("free_bound_cooling", "free-bound C"),
+                    ("free_free_heating", "free-free H"),
+                    ("free_free_cooling", "free-free C"),
+                    (
+                        "collisional_ionization_heating",
+                        "collisional ionization H",
+                    ),
+                    (
+                        "collisional_ionization_cooling",
+                        "collisional ionization C",
+                    ),
+                    ("collisional_bound_heating", "collisional bound H"),
+                    ("collisional_bound_cooling", "collisional bound C"),
+                    ("nonthermal_heating", "nonthermal H"),
+                )
+                budget_report = (
+                    "; thermal budget [erg s^-1 cm^-3]: "
+                    + ", ".join(
+                        f"{label}={shell_budget[name]:.3e}"
+                        for name, label in budget_terms
+                    )
+                )
+                heating_deficit = (
+                    shell_budget["total_heating"]
+                    - shell_budget["total_cooling"]
+                )
+                budget_report += f", H-C={heating_deficit:.6e}"
+                if "electron_density" in shell_budget:
+                    budget_report += (
+                        f"; thermal state: n_e={shell_budget['electron_density']:.6e}"
+                        " cm^-3, "
+                        f"T_e={shell_budget['electron_temperature']:.6e} K"
+                    )
+                if "adiabatic_cooling_estimate" in shell_budget:
+                    adiabatic_cooling = shell_budget[
+                        "adiabatic_cooling_estimate"
+                    ]
+                    cooling_ratio = (
+                        f"{adiabatic_cooling / heating_deficit:.6e}"
+                        if heating_deficit > 0.0
+                        else "n/a (H<=C)"
+                    )
+                    budget_report += (
+                        f", t_exp={shell_budget['time_explosion']:.3e} s; "
+                        "electron adiabatic estimate (excluded from C)="
+                        f"{adiabatic_cooling:.3e} erg s^-1 cm^-3, "
+                        f"adiabatic/(H-C)={cooling_ratio}"
+                    )
+            logger.info(
+                "Outer optimizer iteration %d: cost %.6e, cost reduction "
+                "%.6e, step infinity norm %.6e (nfev=%d); electron max %.3e "
+                "in shell %s; thermal max %.3e in shell %s (signed %.3e, "
+                "T_e/T_rad=%.3e)%s.",
+                intermediate_result.nit,
+                intermediate_result.cost,
+                cost_reduction,
+                step_norm,
+                intermediate_result.nfev,
+                abs(accepted_residual[2 * charge_shell_idx]),
+                level_seed.columns[charge_shell_idx],
+                abs(accepted_residual[2 * thermal_shell_idx + 1]),
+                thermal_shell,
+                accepted_residual[2 * thermal_shell_idx + 1],
+                intermediate_result.x[2 * thermal_shell_idx + 1],
+                budget_report,
+            )
+            previous_optimizer_candidate = intermediate_result.x.copy()
+            previous_optimizer_cost = float(intermediate_result.cost)
 
         least_squares_start_time = perf_counter()
         root = least_squares(
@@ -177,6 +297,7 @@ class PlasmaEquilibriumSolver:
             max_nfev=self.maximum_function_evaluations,
             method="trf",
             jac_sparsity=jacobian_sparsity,
+            callback=report_optimizer_step,
         )
         logger.info(
             "Finished plasma equilibrium least-squares optimization in %.3f "

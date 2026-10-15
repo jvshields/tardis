@@ -1,3 +1,5 @@
+from typing import Literal
+
 import numpy as np
 import pandas as pd
 
@@ -816,6 +818,7 @@ class ContinuumMacroAtomSolver(BoundBoundMacroAtomSolver):
         selected_continuum_transitions: np.ndarray = np.array([]),
         line_interaction_type: str = "macroatom",
         nthreads: int = 1,
+        transition_mode: Literal["absorbing", "direct"] = "absorbing",
     ) -> None:
         """
         Initialize the ContinuumMacroAtomSolver.
@@ -838,6 +841,9 @@ class ContinuumMacroAtomSolver(BoundBoundMacroAtomSolver):
         nthreads
             Maximum number of worker threads for shell-independent opacity
             calculations.
+        transition_mode
+            ``"absorbing"`` constructs the reduced Markov-chain probabilities;
+            ``"direct"`` retains internal transitions for packet traversal.
         """
         super().__init__(
             lines=lines,
@@ -870,6 +876,9 @@ class ContinuumMacroAtomSolver(BoundBoundMacroAtomSolver):
         # )
         self.ionization_energies = ionization_energies
         self.nthreads = nthreads
+        if transition_mode not in ("absorbing", "direct"):
+            raise ValueError(f"Unknown macro-atom transition mode: {transition_mode}")
+        self.transition_mode = transition_mode
 
     def solve(
         self,
@@ -1019,6 +1028,7 @@ class ContinuumMacroAtomSolver(BoundBoundMacroAtomSolver):
             absorbing_probability_matrix,
             photo_ion_block_idx,
             k_packet_idx,
+            transition_mode=self.transition_mode,
         )
 
     def set_static_properties(
@@ -1320,17 +1330,20 @@ class ContinuumMacroAtomSolver(BoundBoundMacroAtomSolver):
         )
         # normalized_probabilities = probabilities_df  # Useful for debugging
 
-        (
-            absorbing_probability_matrix,
-            deactivating_probs,
-        ) = create_absorbing_probs(
-            normalized_probabilities,
-            macro_atom_transition_metadata,
-            max_workers=self.nthreads,
-        )
-        normalized_deactivating_probs = self.normalize_transition_probabilities(
-            deactivating_probs, macro_atom_transition_metadata
-        )
+        absorbing_probability_matrix = None
+        normalized_deactivating_probs = None
+        if self.transition_mode == "absorbing":
+            (
+                absorbing_probability_matrix,
+                deactivating_probs,
+            ) = create_absorbing_probs(
+                normalized_probabilities,
+                macro_atom_transition_metadata,
+                max_workers=self.nthreads,
+            )
+            normalized_deactivating_probs = self.normalize_transition_probabilities(
+                deactivating_probs, macro_atom_transition_metadata
+            )
 
         line2macro_level_upper, references_index = (
             self.create_line2macro_level_upper_and_reference_idx(
@@ -1648,17 +1661,20 @@ class ContinuumMacroAtomSolver(BoundBoundMacroAtomSolver):
         normalized_probabilities = self.normalize_transition_probabilities(
             probabilities_df, macro_atom_transition_metadata
         )
-        (
-            absorbing_probability_matrix,
-            deactivating_probs,
-        ) = create_absorbing_probs(
-            normalized_probabilities,
-            macro_atom_transition_metadata,
-            max_workers=self.nthreads,
-        )
-        normalized_deactivating_probs = self.normalize_transition_probabilities(
-            deactivating_probs, macro_atom_transition_metadata
-        )
+        absorbing_probability_matrix = None
+        normalized_deactivating_probs = None
+        if self.transition_mode == "absorbing":
+            (
+                absorbing_probability_matrix,
+                deactivating_probs,
+            ) = create_absorbing_probs(
+                normalized_probabilities,
+                macro_atom_transition_metadata,
+                max_workers=self.nthreads,
+            )
+            normalized_deactivating_probs = self.normalize_transition_probabilities(
+                deactivating_probs, macro_atom_transition_metadata
+            )
 
         return (
             normalized_probabilities,

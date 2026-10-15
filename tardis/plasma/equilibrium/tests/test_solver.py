@@ -1,3 +1,4 @@
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -62,8 +63,8 @@ def test_equilibrium_solver_reports_residual_evaluation_progress(
 
     Claim
     -----
-    A long equilibrium solve exposes its residual-evaluation count and
-    least-squares completion through INFO logging.
+    A long equilibrium solve retains per-evaluation detail at DEBUG while
+    keeping INFO for accepted optimizer progress.
 
     Regime
     ------
@@ -74,7 +75,7 @@ def test_equilibrium_solver_reports_residual_evaluation_progress(
     The test checks orchestration messages only; the separate analytic-root
     test verifies the numerical result.
     """
-    caplog.set_level("INFO", logger="tardis.plasma.equilibrium.solver")
+    caplog.set_level("DEBUG", logger="tardis.plasma.equilibrium.solver")
     evaluator = AnalyticEvaluator()
 
     PlasmaEquilibriumSolver().solve(
@@ -88,10 +89,159 @@ def test_equilibrium_solver_reports_residual_evaluation_progress(
 
     assert "Starting plasma equilibrium residual evaluation 1" in caplog.text
     assert "Finished plasma equilibrium residual evaluation 1" in caplog.text
+    assert not any(
+        record.levelname == "INFO"
+        and "plasma equilibrium residual evaluation" in record.message
+        for record in caplog.records
+    )
     assert (
         "Finished plasma equilibrium least-squares optimization" in caplog.text
     )
     assert "Finished plasma equilibrium terminal validation" in caplog.text
+
+
+def test_equilibrium_solver_reports_dominant_shells_and_optimizer_cost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Identify the separate charge and thermal blockers and accepted steps.
+
+    Claim: INFO diagnostics distinguish the two shell-local residuals from
+    least-squares progress. Regime: two independent linear shells with a
+    known root. Verification: the initial residuals and cost follow directly
+    from the evaluator's analytic formulas.
+    """
+    caplog.set_level("DEBUG", logger="tardis.plasma.equilibrium.solver")
+    shell_columns = pd.Index([11, 17])
+    level_seed = pd.DataFrame([[0.8, 0.8], [0.2, 0.2]], columns=shell_columns)
+
+    PlasmaEquilibriumSolver().solve(
+        AnalyticEvaluator(),
+        np.array([1.0e9, 4.0e9]),
+        np.array([12000.0, 6000.0]),
+        level_seed,
+        np.full(2, 1.0e10),
+        np.full(2, 1.0e4),
+    )
+
+    initial_log = next(
+        record.message
+        for record in caplog.records
+        if "Finished plasma equilibrium residual evaluation 1 "
+        in record.message
+    )
+    assert "electron-density max 1.000000e+00 in shell 17" in initial_log
+    assert "trial n_e 4.000000e+09 cm^-3" in initial_log
+    assert "thermal max 5.000000e-01 in shell 11" in initial_log
+    assert "trial T_e 1.200000e+04 K" in initial_log
+    assert "trial cost 7.812500e-01" in initial_log
+    first_step_log = next(
+        record.message
+        for record in caplog.records
+        if "Outer optimizer iteration 1" in record.message
+    )
+    progress = re.search(
+        r"cost reduction ([0-9.e+-]+), step infinity norm ([0-9.e+-]+)",
+        first_step_log,
+    )
+    assert progress is not None
+    assert float(progress.group(1)) > 0.0
+    assert float(progress.group(2)) > 0.0
+
+
+@pytest.mark.parametrize("heating_offset", [0.0, 2.0])
+def test_equilibrium_solver_reports_accepted_thermal_budget(
+    caplog: pytest.LogCaptureFixture,
+    heating_offset: float,
+) -> None:
+    """Report the accepted state rather than the last Jacobian perturbation.
+
+    Claim: the displayed heating budget belongs to the accepted thermal
+    state. Regime: one shell with a linear thermal root and a temperature-
+    dependent synthetic heating budget. Verification: compare the displayed
+    heating with the accepted normalized temperature in the same log record.
+    """
+
+    class BudgetEvaluator(AnalyticEvaluator):
+        def evaluate(
+            self,
+            electron_density: np.ndarray,
+            electron_temperature: np.ndarray,
+            level_seed: pd.DataFrame,
+        ) -> SimpleNamespace:
+            evaluation = super().evaluate(
+                electron_density, electron_temperature, level_seed
+            )
+            evaluation.thermal_budget = pd.DataFrame(
+                {
+                    "total_heating": electron_temperature / 1000.0
+                    + heating_offset,
+                    "total_cooling": np.full(len(electron_temperature), 8.0),
+                    "bound_free_heating": np.zeros(len(electron_temperature)),
+                    "free_bound_cooling": np.zeros(len(electron_temperature)),
+                    "free_free_heating": np.zeros(len(electron_temperature)),
+                    "free_free_cooling": np.zeros(len(electron_temperature)),
+                    "collisional_ionization_heating": np.zeros(
+                        len(electron_temperature)
+                    ),
+                    "collisional_ionization_cooling": np.zeros(
+                        len(electron_temperature)
+                    ),
+                    "collisional_bound_heating": np.zeros(
+                        len(electron_temperature)
+                    ),
+                    "collisional_bound_cooling": np.zeros(
+                        len(electron_temperature)
+                    ),
+                    "nonthermal_heating": np.zeros(len(electron_temperature)),
+                    "electron_density": electron_density,
+                    "electron_temperature": electron_temperature,
+                    "time_explosion": np.full(
+                        len(electron_temperature), 172800.0
+                    ),
+                    "adiabatic_cooling_estimate": np.full(
+                        len(electron_temperature), 2.0
+                    ),
+                },
+                index=level_seed.columns,
+            )
+            return evaluation
+
+    caplog.set_level("INFO", logger="tardis.plasma.equilibrium.solver")
+    PlasmaEquilibriumSolver().solve(
+        BudgetEvaluator(),
+        np.array([1.0e9]),
+        np.array([6000.0]),
+        pd.DataFrame([[0.8], [0.2]], columns=[17]),
+        np.array([1.0e10]),
+        np.array([1.0e4]),
+    )
+    step_logs = [
+        record.message
+        for record in caplog.records
+        if "Outer optimizer iteration" in record.message
+    ]
+    assert step_logs
+    for message in step_logs:
+        ratio = float(re.search(r"T_e/T_rad=([0-9.e+-]+)", message).group(1))
+        heating = float(re.search(r"H=([0-9.e+-]+)", message).group(1))
+        assert heating == pytest.approx(10.0 * ratio + heating_offset, rel=1e-3)
+        assert (
+            "electron adiabatic estimate (excluded from C)=2.000e+00" in message
+        )
+        temperature = float(re.search(r"T_e=([0-9.e+-]+) K", message).group(1))
+        assert temperature == pytest.approx(1.0e4 * ratio, rel=1e-3)
+        assert "t_exp=1.728e+05 s" in message
+        deficit = float(re.search(r"H-C=([0-9.e+-]+)", message).group(1))
+        assert deficit == pytest.approx(heating - 8.0, abs=0.01)
+        if heating_offset == 0.0:
+            assert "adiabatic/(H-C)=n/a (H<=C)" in message
+        else:
+            cooling_ratio = float(
+                re.search(
+                    r"adiabatic/\(H-C\)=([0-9.]+e[+-][0-9]+)", message
+                ).group(1)
+            )
+            assert cooling_ratio == pytest.approx(2.0 / deficit, rel=1e-3)
 
 
 def test_equilibrium_solver_supplies_shell_local_jacobian_sparsity(

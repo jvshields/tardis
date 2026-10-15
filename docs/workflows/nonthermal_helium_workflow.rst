@@ -16,12 +16,18 @@ has finished. It therefore never constructs a Spencer--Fano system inside a
 SciPy residual evaluation. High-energy Monte Carlo transport is also frozen
 throughout the optical calculation.
 
-The optical calculation currently uses classic bound--bound macro-atom
-transport. Continuum packet processes and the Type IIP absorbing Markov-chain
-solver are not enabled. Photoionization atomic data are retained for the
-equilibrium calculation, where bound--free rates use the analytic dilute
-blackbody radiation field. Adding Monte Carlo bound--free estimators is a
-separate future extension.
+The optical calculation uses continuum packet processes with direct macro-atom
+traversal. Each activated macro atom follows its normalized internal
+transitions until deactivation; the Type IIP absorbing Markov-chain matrix is
+not constructed. The first optical transport uses analytic continuum rates to
+initialize its packet state. Subsequent plasma solves use the packet
+photoionization and heating estimators, while the nonthermal rates remain fixed
+within each coupled evaluator solve. Bound--bound transitions without CMFGEN
+collision strengths retain the existing van Regemorter approximation for
+their collisional macro-atom branches.
+
+Helium-only continuum atomic data do not require an H I ground-state entry;
+hydrogen Case B suppression applies only when that entry is present.
 
 Rate conventions
 ----------------
@@ -37,9 +43,10 @@ The fixed bound--bound channel has units of inverse seconds and enters as
 Consequently, a nonthermal rate is not multiplied by an electron density or a
 Sobolev escape probability. The same stage-averaged He I ionization
 coefficient must be supplied to both ``PlasmaEquilibriumEvaluator`` and the
-``AnalyticIonRateMatrix`` used by its ion population solver. The current
-first-version approximation applies that coefficient uniformly to every He I
-bound level.
+ion rate matrix used by its ion population solver. Following the first optical
+transport, that matrix uses estimated photoionization rates. The current
+first-version approximation applies the nonthermal coefficient uniformly to
+every He I bound level.
 
 ``FixedRateState.heating_rate_density`` is in
 ``erg s^-1 cm^-3``. It is added once to the heating side of the thermal balance

@@ -11,6 +11,8 @@ where test data is prepared in fixtures and regression data is used for validati
 ### FIX THIS TO ONLY TEST HYDROGEN FOR NOW
 # from copy import deepcopy
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pandas.testing as pdt
@@ -23,7 +25,12 @@ from tardis.opacities.macro_atom.macroatom_solver import (
     ContinuumMacroAtomSolver,
 )
 from tardis.opacities.macro_atom.macroatom_state import MacroAtomState
-from tardis.transport.montecarlo.macro_atom import MacroAtomTransitionType
+from tardis.opacities.opacity_state import OpacityState
+from tardis.transport.montecarlo.configuration import montecarlo_globals
+from tardis.transport.montecarlo.macro_atom import (
+    MacroAtomTransitionType,
+    macro_atom_interaction,
+)
 
 
 @pytest.fixture(
@@ -256,6 +263,125 @@ def continuum_macro_atom_state(
     )
 
 
+def test_direct_continuum_macro_atom_retains_internal_transitions(
+    continuum_macro_atom_solver: ContinuumMacroAtomSolver,
+    continuum_solver_input_data: dict[str, object],
+    continuum_macro_atom_input_state: ContinuumMacroAtomState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct traversal uses normalized internal transitions without reduction.
+
+    Claim
+    -----
+    Continuum macro-atom source blocks remain complete probability laws.
+
+    Regime
+    ------
+    Five-shell hydrogen network with line, continuum, and collision branches.
+
+    Verification
+    ------------
+    Independently sum probabilities by source and reject any absorbing solve.
+    """
+    def reject_absorbing_solve(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Direct mode called the absorbing-chain solver")
+
+    monkeypatch.setattr(
+        "tardis.opacities.macro_atom.macroatom_solver.create_absorbing_probs",
+        reject_absorbing_solve,
+    )
+    continuum_macro_atom_solver.transition_mode = "direct"
+    for _ in range(2):
+        state = continuum_macro_atom_solver.solve(
+            continuum_solver_input_data["mean_intensities_blue_wing"],
+            continuum_solver_input_data["beta_sobolevs"],
+            continuum_solver_input_data["stimulated_emission_factors"],
+            continuum_macro_atom_input_state,
+            continuum_solver_input_data["electron_densities"],
+        )
+        totals = state.transition_probabilities.groupby(
+            state.transition_metadata.source
+        ).sum()
+        active_totals = totals.loc[(totals != 0.0).any(axis=1)]
+        np.testing.assert_allclose(
+            active_totals, 1.0, rtol=1e-12, atol=1e-12
+        )
+        assert (
+            state.transition_metadata.transition_type.to_numpy() >= 0
+        ).any()
+        assert state.absorbing_probability_matrix is None
+        assert continuum_macro_atom_solver.line_interaction_type == "macroatom"
+
+
+def test_direct_continuum_macro_atom_compiles_for_transport(
+    continuum_macro_atom_solver: ContinuumMacroAtomSolver,
+    continuum_solver_input_data: dict[str, object],
+    continuum_macro_atom_input_state: ContinuumMacroAtomState,
+    iip_atom_data: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full transition table is consumable by the compiled packet walk.
+
+    Claim
+    -----
+    Direct continuum mode traverses a normalized macro-atom block in Numba.
+
+    Regime
+    ------
+    Five-shell hydrogen continuum network with empty absorbing matrix.
+
+    Verification
+    ------------
+    Convert the Python opacity state and observe a deactivating transition.
+    """
+    continuum_macro_atom_solver.transition_mode = "direct"
+    inputs = continuum_solver_input_data
+    macro_state = continuum_macro_atom_solver.solve(
+        inputs["mean_intensities_blue_wing"],
+        inputs["beta_sobolevs"],
+        inputs["stimulated_emission_factors"],
+        continuum_macro_atom_input_state,
+        inputs["electron_densities"],
+    )
+    shell_count = len(inputs["electron_densities"])
+    continuum_state = SimpleNamespace(
+        bf_threshold_list_nu=pd.Series([1.0]),
+        p_fb_deactivation=pd.DataFrame(np.zeros((1, shell_count))),
+        phot_nus=pd.Series([1.0]),
+        photo_ion_block_references=np.array([0], dtype=np.int64),
+        photo_ion_nu_threshold_mins=pd.Series([1.0]),
+        photo_ion_nu_threshold_maxs=pd.Series([2.0]),
+        chi_bf=pd.DataFrame(np.zeros((1, shell_count))),
+        x_sect=pd.Series([0.0]),
+        ff_cooling_factor=np.ones(shell_count),
+        emissivities=pd.DataFrame(np.zeros((1, shell_count))),
+        photo_ion_activation_idx=pd.Series([0], dtype=np.int64),
+        level2continuum_idx=pd.Series([0]),
+    )
+    opacity_state = OpacityState(
+        inputs["electron_densities"],
+        np.full(shell_count, 6000.0),
+        iip_atom_data.lines.loc[[1]].nu,
+        inputs["beta_sobolevs"],
+        inputs["beta_sobolevs"],
+        continuum_state,
+    )
+    monkeypatch.setattr(
+        montecarlo_globals, "CONTINUUM_PROCESSES_ENABLED", True
+    )
+    numba_state = opacity_state.to_numba(macro_state, "macroatom")
+
+    assert numba_state.absorbing_markov_probabilities.shape == (0, 0, 0)
+    assert numba_state.transition_probabilities.shape == (
+        len(macro_state.transition_metadata),
+        shell_count,
+    )
+    _, transition_type = macro_atom_interaction(
+        int(numba_state.line2macro_level_upper[0]), 0, numba_state
+    )
+    assert transition_type < 0
+
+
 class TestContinuumMacroAtomSolver:
     """Test suite for ContinuumMacroAtomSolver integration."""
 
@@ -263,7 +389,6 @@ class TestContinuumMacroAtomSolver:
         """Test that ContinuumMacroAtomSolver initializes correctly."""
         assert continuum_macro_atom_solver is not None
         assert isinstance(continuum_macro_atom_solver, ContinuumMacroAtomSolver)
-        assert continuum_macro_atom_solver.line_interaction_type == "macroatom"
 
     def test_macro_atom_state_structure(self, continuum_macro_atom_state):
         """Test that returned MacroAtomState has the correct structure."""

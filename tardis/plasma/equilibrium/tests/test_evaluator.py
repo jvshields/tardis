@@ -7,6 +7,7 @@ import pandas.testing as pdt
 import pytest
 from astropy import units as u
 
+from tardis import constants as const
 from tardis.plasma.electron_energy_distribution import (
     ThermalElectronEnergyDistribution,
 )
@@ -151,13 +152,13 @@ def test_evaluator_uses_temperature_dependent_continuum_coefficients(
 def test_evaluator_reports_stage_timing(
     toy_evaluator: PlasmaEquilibriumEvaluator,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Expose progress through one complete equilibrium evaluation.
 
     Claim
     -----
-    Each expensive evaluator stage emits an INFO completion message so a long
-    plasma solve can be localized without changing its physics.
+    Each evaluator stage remains visible at DEBUG without flooding INFO.
 
     Regime
     ------
@@ -169,7 +170,10 @@ def test_evaluator_reports_stage_timing(
     This is an orchestration assertion over stage labels only; it deliberately
     makes no machine-dependent assertion about elapsed time.
     """
-    caplog.set_level("INFO", logger="tardis.plasma.equilibrium.evaluator")
+    caplog.set_level("DEBUG", logger="tardis.plasma.equilibrium.evaluator")
+    monkeypatch.setattr(
+        "tardis.plasma.equilibrium.evaluator.perf_counter", lambda: 0.0
+    )
 
     toy_evaluator.evaluate(
         np.array([1.0e9]),
@@ -188,6 +192,16 @@ def test_evaluator_reports_stage_timing(
     ):
         assert f"finished {stage}" in caplog.text
     assert "Finished plasma equilibrium evaluator call 1" in caplog.text
+    assert not any(
+        record.levelname == "INFO"
+        and "plasma equilibrium evaluator call" in record.message.lower()
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelname == "INFO"
+        and "equilibrium level solve" in record.message
+        for record in caplog.records
+    )
 
 
 def test_continuum_coefficients_preserve_nonconsecutive_shell_labels(
@@ -471,8 +485,10 @@ def test_evaluator_accepts_physical_level_iterate_when_optimizer_stalls(
 def test_level_fallback_starts_from_best_feasible_root_evaluation(
     toy_evaluator: PlasmaEquilibriumEvaluator,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Reuse the lowest-residual feasible root evaluation in the fallback."""
+    caplog.set_level("INFO", logger="tardis.plasma.equilibrium.evaluator")
     evaluator = toy_evaluator
     continuum_rates = evaluator.calculate_continuum_coefficients(
         np.array([1.0e4])
@@ -527,6 +543,8 @@ def test_level_fallback_starts_from_best_feasible_root_evaluation(
     evaluator._calculate_level_solution(*arguments)
 
     npt.assert_array_equal(fallback_starts, [best_candidate])
+    assert "Starting bounded equilibrium level fallback" in caplog.text
+    assert "Finished equilibrium level solve" in caplog.text
 
 
 def test_level_fallback_considers_feasible_projection_of_root_endpoint(
@@ -720,6 +738,56 @@ def test_evaluator_rebuilds_final_residual_and_is_deterministic(
     pdt.assert_frame_equal(level_initial_guess, original_initial_guess)
 
 
+def test_evaluator_reports_adiabatic_estimate_without_changing_balance(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+) -> None:
+    """Compare electron expansion work with the unchanged heating deficit.
+
+    Claim: diagnostic cooling equals electron pressure times 3/t and does
+    not enter the thermal residual. Regime: one homologously expanding cell,
+    with an age in days distinct from the Monte Carlo normalization time.
+    Verification: the ideal-electron-gas energy density loses 2u/t; synthetic
+    heating and cooling retain their prescribed net and fractional rates.
+    """
+
+    class ThermalSolver:
+        def solve(self, **kwargs: object) -> tuple[pd.Series, pd.Series]:
+            self.last_budget = pd.DataFrame(
+                {"total_heating": [3.0e-11], "total_cooling": [1.0e-11]},
+                index=kwargs["level_population"].columns,
+            )
+            return pd.Series([2.0e-11]), pd.Series([2.0])
+
+    toy_evaluator.thermal_balance_solver = ThermalSolver()
+    toy_evaluator.time_explosion = 2.0 * u.day
+    electron_distribution = ThermalElectronEnergyDistribution(
+        0.0 * u.erg,
+        np.array([1.0e4]) * u.K,
+        np.array([2.0e9]) / u.cm**3,
+    )
+    net_heating, fractional_heating, budget = toy_evaluator._calculate_heating(
+        electron_distribution,
+        pd.DataFrame([[1.0]], columns=[17]),
+        None,
+        SimpleNamespace(
+            collisional_ionization_rate_coefficient=pd.DataFrame(columns=[17]),
+            level_to_continuum_saha_factor=pd.DataFrame(columns=[17]),
+        ),
+    )
+    electron_energy_density = (
+        1.5 * const.k_B.cgs * 1.0e4 * u.K * 2.0e9 / u.cm**3
+    )
+    expected_cooling = (2 * electron_energy_density / (2 * u.day)).to_value(
+        u.erg / (u.cm**3 * u.s)
+    )
+    npt.assert_allclose(budget["adiabatic_cooling_estimate"], expected_cooling)
+    npt.assert_allclose(budget["electron_density"], [2.0e9])
+    npt.assert_allclose(budget["electron_temperature"], [1.0e4])
+    npt.assert_allclose(budget["time_explosion"], [172800.0])
+    npt.assert_allclose(net_heating, [2.0e-11], rtol=1e-14)
+    npt.assert_allclose(fractional_heating, [2.0], rtol=1e-14)
+
+
 def test_evaluator_closes_at_known_one_shell_thermal_root(
     toy_evaluator: PlasmaEquilibriumEvaluator,
 ) -> None:
@@ -857,7 +925,7 @@ def test_evaluator_aligns_collisional_temperature_scaling_by_transition(
         level_to_continuum_saha_factor=pd.DataFrame(columns=[0]),
     )
 
-    excitation, deexcitation = toy_evaluator._calculate_heating(
+    excitation, deexcitation, budget = toy_evaluator._calculate_heating(
         ThermalElectronEnergyDistribution(
             0.0 * u.erg,
             np.array([2.0e4]) * u.K,
@@ -867,6 +935,7 @@ def test_evaluator_aligns_collisional_temperature_scaling_by_transition(
         None,
         state,
     )
+    assert budget is None
 
     pdt.assert_series_equal(
         excitation,

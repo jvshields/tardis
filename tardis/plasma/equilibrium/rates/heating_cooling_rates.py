@@ -398,10 +398,23 @@ class CollisionalIonizationThermalRates:
             * const.h.cgs.value
         )
 
+        level_index = collisional_ionization_rate_coefficient.index
+        upper_ion_index = pd.MultiIndex.from_arrays(
+            [
+                level_index.get_level_values("atomic_number"),
+                level_index.get_level_values("ion_number") + 1,
+            ],
+            names=ion_population.index.names,
+        )
+        upper_ion_population = ion_population.reindex(
+            upper_ion_index, fill_value=0.0
+        )
+        upper_ion_population.index = level_index
+
         heating_rate = (
             electron_density.cgs.value
-            * ion_population.loc[(1, 1)]
-            * level_population_ratio
+            * upper_ion_population
+            * level_population_ratio.reindex(level_index, fill_value=0.0)
             * rate_factor
         ).sum()
 

@@ -219,8 +219,13 @@ class OpacityState:
         elif (
             montecarlo_globals.CONTINUUM_PROCESSES_ENABLED
         ):  # continuum settings
+            direct_macro_atom = macro_atom_state.transition_mode == "direct"
             transition_probabilities = np.ascontiguousarray(
-                macro_atom_state.normalized_deactivating_probs.values.copy(),
+                (
+                    macro_atom_state.transition_probabilities
+                    if direct_macro_atom
+                    else macro_atom_state.normalized_deactivating_probs
+                ).values.copy(),
                 dtype=np.float64,
             )
             line2macro_level_upper = (
@@ -278,7 +283,9 @@ class OpacityState:
                 )
             k_packet_idx = np.int64(macro_atom_state.k_packet_idx)
             absorbing_markov_probabilities = (
-                macro_atom_state.absorbing_probability_matrix
+                np.empty((0, 0, 0), dtype=np.float64)
+                if direct_macro_atom
+                else macro_atom_state.absorbing_probability_matrix
             )
             return OpacityStateNumbaIIP(
                 electron_densities,
