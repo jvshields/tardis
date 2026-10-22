@@ -54,12 +54,37 @@ class PlasmaEquilibriumSolver:
         maximum_temperature_ratio: float = 1.5,
         maximum_function_evaluations: int = 100,
         residual_tolerance: float = 1.0e-7,
+        fixed_temperature_ratio: float | None = None,
     ) -> None:
-        """Configure physical bounds and nonlinear-solver effort."""
+        """Configure bounds, solver effort, and optional prescribed temperature.
+
+        Parameters
+        ----------
+        minimum_electron_temperature : float, optional
+            Temperature floor in kelvin for coupled thermal-balance solves.
+        maximum_temperature_ratio : float, optional
+            Upper T_e/T_rad bound for coupled thermal-balance solves.
+        maximum_function_evaluations : int, optional
+            Maximum number of nonlinear function evaluations.
+        residual_tolerance : float, optional
+            Maximum accepted absolute normalized residual.
+        fixed_temperature_ratio : float or None, optional
+            Prescribe T_e/T_rad and solve only for electron density when set.
+            Thermal residuals and temperature bounds are unused in this mode.
+            None retains the coupled density-temperature solve.
+        """
         self.minimum_electron_temperature = minimum_electron_temperature
         self.maximum_temperature_ratio = maximum_temperature_ratio
         self.maximum_function_evaluations = maximum_function_evaluations
         self.residual_tolerance = residual_tolerance
+        if fixed_temperature_ratio is not None and (
+            not np.isfinite(fixed_temperature_ratio)
+            or fixed_temperature_ratio <= 0.0
+        ):
+            raise ValueError(
+                "fixed_temperature_ratio must be finite and positive."
+            )
+        self.fixed_temperature_ratio = fixed_temperature_ratio
 
     def solve(
         self,
@@ -70,7 +95,7 @@ class PlasmaEquilibriumSolver:
         maximum_electron_density: npt.ArrayLike,
         radiation_temperature: npt.ArrayLike,
     ) -> PlasmaEquilibriumSolution:
-        """Solve charge and thermal residuals with fixed rate inputs.
+        """Solve charge and optionally thermal residuals with fixed rate inputs.
 
         Parameters
         ----------
@@ -85,7 +110,8 @@ class PlasmaEquilibriumSolver:
         maximum_electron_density : array-like
             Full-ionization electron-density scale.
         radiation_temperature : array-like
-            Radiation-temperature scale for the thermal unknown.
+            Radiation-temperature scale for the thermal unknown or the
+            prescribed electron temperature.
 
         Returns
         -------
@@ -101,28 +127,36 @@ class PlasmaEquilibriumSolver:
             radiation_temperature, dtype=np.float64
         )
         shell_count = len(initial_density)
+        variable_stride = 2 if self.fixed_temperature_ratio is None else 1
+        prescribed_temperature = (
+            None
+            if self.fixed_temperature_ratio is None
+            else self.fixed_temperature_ratio * radiation_temperature
+        )
         solve_start_time = perf_counter()
         logger.info(
             "Starting plasma equilibrium solve for %d shells (%d variables; "
             "maximum function evaluations %d).",
             shell_count,
-            2 * shell_count,
+            variable_stride * shell_count,
             self.maximum_function_evaluations,
         )
-        initial_guess = np.empty(2 * shell_count)
-        initial_guess[::2] = initial_density / maximum_density
-        initial_guess[1::2] = initial_temperature / radiation_temperature
+        initial_guess = np.empty(variable_stride * shell_count)
+        initial_guess[::variable_stride] = initial_density / maximum_density
         lower_bound = np.empty_like(initial_guess)
-        lower_bound[::2] = np.finfo(float).eps
-        lower_bound[1::2] = (
-            self.minimum_electron_temperature / radiation_temperature
-        )
+        lower_bound[::variable_stride] = np.finfo(float).eps
         upper_bound = np.empty_like(initial_guess)
-        upper_bound[::2] = 1.0
-        upper_bound[1::2] = self.maximum_temperature_ratio
+        upper_bound[::variable_stride] = 1.0
+        if prescribed_temperature is None:
+            initial_guess[1::2] = initial_temperature / radiation_temperature
+            lower_bound[1::2] = (
+                self.minimum_electron_temperature / radiation_temperature
+            )
+            upper_bound[1::2] = self.maximum_temperature_ratio
         initial_guess = np.clip(initial_guess, lower_bound, upper_bound)
         jacobian_sparsity = block_diag(
-            [np.ones((2, 2), dtype=bool)] * shell_count,
+            [np.ones((variable_stride, variable_stride), dtype=bool)]
+            * shell_count,
             format="csr",
         )
         residual_evaluation_count = 0
@@ -142,21 +176,41 @@ class PlasmaEquilibriumSolver:
                 evaluation_idx,
             )
             evaluation = evaluator.evaluate(
-                maximum_density * candidate[::2],
-                radiation_temperature * candidate[1::2],
+                maximum_density * candidate[::variable_stride],
+                (
+                    radiation_temperature * candidate[1::2]
+                    if prescribed_temperature is None
+                    else prescribed_temperature
+                ),
                 level_seed,
             )
-            if (
-                evaluation.electron_residual is None
-                or evaluation.fractional_heating is None
-            ):
+            if evaluation.electron_residual is None:
+                raise ValueError(
+                    "The evaluator must provide electron residuals."
+                )
+            electron_residual = np.asarray(
+                evaluation.electron_residual, dtype=np.float64
+            )
+            if prescribed_temperature is not None:
+                trial_cost = float(
+                    0.5 * np.dot(electron_residual, electron_residual)
+                )
+                if evaluation_idx == 1:
+                    previous_optimizer_cost = trial_cost
+                logger.debug(
+                    "Finished plasma equilibrium residual evaluation %d in %.3f s "
+                    "(electron-density max %.6e; fixed T_e/T_rad=%.3f).",
+                    evaluation_idx,
+                    perf_counter() - evaluation_start_time,
+                    np.max(np.abs(electron_residual)),
+                    self.fixed_temperature_ratio,
+                )
+                return electron_residual
+            if evaluation.fractional_heating is None:
                 raise ValueError(
                     "The evaluator must provide electron and thermal residuals."
                 )
             result = np.empty_like(candidate)
-            electron_residual = np.asarray(
-                evaluation.electron_residual, dtype=np.float64
-            )
             thermal_residual = np.asarray(
                 evaluation.fractional_heating, dtype=np.float64
             )
@@ -205,7 +259,26 @@ class PlasmaEquilibriumSolver:
             cost_reduction = float(
                 previous_optimizer_cost - intermediate_result.cost
             )
-            charge_shell_idx = int(np.argmax(np.abs(accepted_residual[::2])))
+            charge_shell_idx = int(
+                np.argmax(np.abs(accepted_residual[::variable_stride]))
+            )
+            if prescribed_temperature is not None:
+                logger.info(
+                    "Outer optimizer iteration %d: cost %.6e, cost reduction "
+                    "%.6e, step infinity norm %.6e (nfev=%d); electron max %.3e "
+                    "in shell %s (fixed T_e/T_rad=%.3f).",
+                    intermediate_result.nit,
+                    intermediate_result.cost,
+                    cost_reduction,
+                    step_norm,
+                    intermediate_result.nfev,
+                    abs(accepted_residual[charge_shell_idx]),
+                    level_seed.columns[charge_shell_idx],
+                    self.fixed_temperature_ratio,
+                )
+                previous_optimizer_candidate = intermediate_result.x.copy()
+                previous_optimizer_cost = float(intermediate_result.cost)
+                return
             thermal_shell_idx = int(np.argmax(np.abs(accepted_residual[1::2])))
             thermal_shell = level_seed.columns[thermal_shell_idx]
             budget = thermal_budgets.get(intermediate_result.x.tobytes())
@@ -314,8 +387,12 @@ class PlasmaEquilibriumSolver:
             raise RuntimeError(
                 "Plasma equilibrium solve failed: " + root.message
             )
-        electron_density = maximum_density * root.x[::2]
-        electron_temperature = radiation_temperature * root.x[1::2]
+        electron_density = maximum_density * root.x[::variable_stride]
+        electron_temperature = (
+            radiation_temperature * root.x[1::2]
+            if prescribed_temperature is None
+            else prescribed_temperature
+        )
         terminal_validation_start_time = perf_counter()
         seed_evaluation = evaluator.evaluate(
             electron_density,
@@ -327,18 +404,19 @@ class PlasmaEquilibriumSolver:
             electron_temperature,
             seed_evaluation.normalized_population,
         )
-        terminal_residual = np.concatenate(
-            [
-                np.asarray(
-                    terminal_evaluation.electron_residual,
-                    dtype=np.float64,
-                ),
-                np.asarray(
-                    terminal_evaluation.fractional_heating,
-                    dtype=np.float64,
-                ),
-            ]
+        terminal_residual = np.asarray(
+            terminal_evaluation.electron_residual, dtype=np.float64
         )
+        if prescribed_temperature is None:
+            terminal_residual = np.concatenate(
+                [
+                    terminal_residual,
+                    np.asarray(
+                        terminal_evaluation.fractional_heating,
+                        dtype=np.float64,
+                    ),
+                ]
+            )
         if not np.all(np.isfinite(terminal_residual)):
             raise RuntimeError(
                 "Plasma equilibrium solve returned nonfinite residuals."

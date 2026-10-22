@@ -309,6 +309,7 @@ class PlasmaEquilibriumEvaluator:
         fixed_rates: FixedRateState | None = None,
         case_b_species: Collection[tuple[int, int]] = ((1, 0),),
         time_explosion: u.Quantity | None = None,
+        background_level_population_fraction: pd.DataFrame | None = None,
     ) -> None:
         """Construct an evaluator from fixed scientific inputs.
 
@@ -365,6 +366,12 @@ class PlasmaEquilibriumEvaluator:
             Homologous expansion age for an electron adiabatic cooling
             estimate in the diagnostic thermal budget. This estimate is not
             included in the thermal-balance residual.
+        background_level_population_fraction : pandas.DataFrame, optional
+            Existing excitation fractions, indexed like the full level
+            population, for rebuilding ions whose finite input levels sum
+            to zero. Nonempty distributions retain their original fractions;
+            the reduced NLTE species is still replaced by its solved levels.
+            Without this input, zero background populations remain unchanged.
         """
         self.photoionization_cross_sections = photoionization_cross_sections
         self.level2continuum_edge_idx = level2continuum_edge_idx
@@ -426,6 +433,14 @@ class PlasmaEquilibriumEvaluator:
         self.fixed_rates = fixed_rates
         self.case_b_species = frozenset(case_b_species)
         self.time_explosion = time_explosion
+        self.background_level_population_fraction = (
+            None
+            if background_level_population_fraction is None
+            else background_level_population_fraction.reindex(
+                index=level_population_index,
+                columns=elemental_number_density.columns,
+            ).copy(deep=True)
+        )
         self._level_solution_cache: dict[int, npt.NDArray[np.float64]] = {}
         self._evaluation_count = 0
 
@@ -1068,6 +1083,17 @@ class PlasmaEquilibriumEvaluator:
                     :, ~nonzero_density.to_numpy()
                 ]
             )
+            if self.background_level_population_fraction is not None:
+                empty = (~nonzero_density.to_numpy()) & np.isfinite(
+                    state.full_population.iloc[positions].to_numpy()
+                ).all(axis=0)
+                background_values = (
+                    self.background_level_population_fraction.iloc[
+                        positions
+                    ].to_numpy()
+                    * ion_density.to_numpy()
+                )
+                scaled_values[:, empty] = background_values[:, empty]
             absolute_levels.iloc[positions] = scaled_values
 
         species_ion_population = ion_population.loc[self.equilibrium_species]

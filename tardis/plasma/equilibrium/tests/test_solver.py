@@ -56,6 +56,96 @@ def test_equilibrium_solver_finds_normalized_density_temperature_root() -> None:
     assert evaluator.calls > 2
 
 
+@pytest.mark.parametrize("thermal_residual", [None, np.nan, 1.0e6])
+@pytest.mark.parametrize("shell_count", [1, 2])
+def test_equilibrium_solver_prescribes_temperature_and_solves_only_charge(
+    thermal_residual: float | None,
+    shell_count: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Prescribe 0.9 T_rad while retaining the exact electron-density root.
+
+    Claim: unused or nonfinite thermal residuals cannot affect a prescribed
+    temperature. Regime: two independent linear charge roots and a thermal
+    root inconsistent with 0.9 T_rad. Verification: every evaluation, including
+    terminal validation, uses the prescribed temperatures; the charge root is
+    2e9 cm^-3 to the existing analytic-root tolerance (1e-10 relative).
+    """
+    temperatures = []
+
+    class FixedTemperatureEvaluator(AnalyticEvaluator):
+        def evaluate(
+            self,
+            electron_density: np.ndarray,
+            electron_temperature: np.ndarray,
+            level_seed: pd.DataFrame,
+        ) -> SimpleNamespace:
+            temperatures.append(electron_temperature.copy())
+            evaluation = super().evaluate(
+                electron_density, electron_temperature, level_seed
+            )
+            evaluation.fractional_heating = (
+                None
+                if thermal_residual is None
+                else pd.Series(thermal_residual, index=level_seed.columns)
+            )
+            return evaluation
+
+    caplog.set_level("INFO", logger="tardis.plasma.equilibrium.solver")
+    solver = PlasmaEquilibriumSolver(
+        fixed_temperature_ratio=0.9, minimum_electron_temperature=9500.0
+    )
+    shell_columns = [17, 54][:shell_count]
+    solution = solver.solve(
+        FixedTemperatureEvaluator(),
+        np.array([1.0e9, 3.0e9])[:shell_count],
+        np.array([6000.0, 7000.0])[:shell_count],
+        pd.DataFrame(
+            np.tile([[0.8], [0.2]], shell_count), columns=shell_columns
+        ),
+        np.full(shell_count, 1.0e10),
+        np.array([1.0e4, 1.2e4])[:shell_count],
+    )
+
+    npt.assert_allclose(solution.electron_density, 2.0e9, rtol=1e-10)
+    expected_temperature = np.array([9000.0, 10800.0])[:shell_count]
+    npt.assert_array_equal(solution.electron_temperature, expected_temperature)
+    for temperature in temperatures:
+        npt.assert_array_equal(temperature, expected_temperature)
+    assert f"{shell_count} shells ({shell_count} variables" in caplog.text
+    assert "fixed T_e/T_rad=0.900" in caplog.text
+
+
+def test_prescribed_temperature_still_requires_charge_closure() -> None:
+    """Reject a stalled charge residual despite a prescribed temperature."""
+
+    class StalledChargeEvaluator(AnalyticEvaluator):
+        def evaluate(
+            self,
+            electron_density: np.ndarray,
+            electron_temperature: np.ndarray,
+            level_seed: pd.DataFrame,
+        ) -> SimpleNamespace:
+            evaluation = super().evaluate(
+                electron_density, electron_temperature, level_seed
+            )
+            evaluation.electron_residual[:] = 1.0e-2
+            evaluation.fractional_heating = None
+            return evaluation
+
+    with pytest.raises(
+        RuntimeError, match="did not close its normalized residuals"
+    ):
+        PlasmaEquilibriumSolver(fixed_temperature_ratio=0.9).solve(
+            StalledChargeEvaluator(),
+            np.array([1.0e9]),
+            np.array([6000.0]),
+            pd.DataFrame([[0.8], [0.2]], columns=[17]),
+            np.array([1.0e10]),
+            np.array([1.0e4]),
+        )
+
+
 def test_equilibrium_solver_reports_residual_evaluation_progress(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

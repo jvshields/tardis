@@ -131,6 +131,75 @@ def toy_evaluator() -> PlasmaEquilibriumEvaluator:
     )
 
 
+@pytest.mark.parametrize("supply_background", [True, False])
+def test_evaluator_repopulates_zeroed_background_ion(
+    toy_evaluator: PlasmaEquilibriumEvaluator,
+    supply_background: bool,
+) -> None:
+    """Repopulate a zeroed trace ion from explicit background fractions.
+
+    Regime: Li I has zero levels in shell 25, a populated [3, 1] distribution
+    in shell 53, and zero ion density in shell 7. New ion totals are 2e-23,
+    8, and 0 cm^-3. Given fractions [0.8, 0.2], the revived levels must be
+    [1.6e-23, 4e-24]; the existing distribution must instead rescale to [6, 2].
+    Verification uses these analytic values and per-ion conservation with
+    rtol=1e-14 (roundoff only), no absolute tolerance that could hide the trace
+    population. Without explicit fractions, legacy zero-background behavior
+    is preserved. This verifies rebuilding, not the excitation prescription.
+    """
+    evaluator = toy_evaluator
+    level_index = pd.MultiIndex.from_tuples(
+        [(1, 0, 0), (1, 0, 1), (3, 0, 0), (3, 0, 1)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    columns = pd.Index([25, 53, 7])
+    evaluator.level_population_index = level_index
+    evaluator.background_level_population_fraction = (
+        pd.DataFrame(
+            [[0.5] * 3, [0.5] * 3, [0.8] * 3, [0.2] * 3],
+            index=level_index,
+            columns=columns,
+        )
+        if supply_background
+        else None
+    )
+    state = SimpleNamespace(
+        species_index=level_index[:2],
+        full_population=pd.DataFrame(
+            [[1.0] * 3, [1.0] * 3, [0.0, 3.0, 0.0], [0.0, 1.0, 0.0]],
+            index=level_index,
+            columns=columns,
+        ),
+        normalized_population=pd.DataFrame(
+            [[0.25] * 3, [0.75] * 3],
+            index=level_index[:2],
+            columns=columns,
+        ),
+    )
+    ions = pd.DataFrame(
+        [[2.0] * 3, [2.0e-23, 8.0, 0.0]],
+        index=level_index.droplevel("level_number").unique(),
+        columns=columns,
+    )
+    levels = evaluator._build_absolute_levels(state, ions)
+    npt.assert_allclose(
+        levels.loc[(3, 0), 25],
+        [1.6e-23, 4e-24] if supply_background else [0.0, 0.0],
+        rtol=1e-14,
+        atol=0.0,
+    )
+    npt.assert_allclose(levels.loc[(3, 0), 53], [6.0, 2.0], rtol=1e-14)
+    npt.assert_array_equal(levels.loc[(3, 0), 7], 0.0)
+    npt.assert_allclose(levels.loc[(1, 0), 25], [0.5, 1.5], rtol=1e-14)
+    if supply_background:
+        pdt.assert_frame_equal(
+            levels.groupby(level=["atomic_number", "ion_number"]).sum(),
+            ions,
+            rtol=1e-14,
+            atol=0.0,
+        )
+
+
 def test_evaluator_uses_temperature_dependent_continuum_coefficients(
     toy_evaluator: PlasmaEquilibriumEvaluator,
 ) -> None:

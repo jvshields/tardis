@@ -21,6 +21,7 @@ from tardis.workflows.nonthermal_helium_workflow import (
     NonthermalHeliumOpticalWorkflow,
     NonthermalHeliumPlasmaSolver,
     NonthermalHeliumWorkflow,
+    _IonRelaxationController,
 )
 from tardis.workflows.standard_tardis_workflow import StandardTARDISWorkflow
 
@@ -30,6 +31,7 @@ class FakeNonthermalSolver:
 
     def __init__(self) -> None:
         self.electron_densities: list[float] = []
+        self.electron_temperatures: list[np.ndarray] = []
 
     def solve(self, plasma_input: object) -> NonthermalPlasmaState:
         electron_densities = plasma_input.electron_number_density.to_value(
@@ -37,6 +39,9 @@ class FakeNonthermalSolver:
         )
         electron_density = float(electron_densities[0])
         self.electron_densities.append(electron_density)
+        self.electron_temperatures.append(
+            plasma_input.electron_temperature.to_value(u.K).copy()
+        )
         shell_columns = plasma_input.ion_number_density.columns
         ion_index = pd.MultiIndex.from_tuples(
             [(2, 0, 0, 1)],
@@ -67,6 +72,7 @@ class FixedEquilibriumSolver:
 
     def __init__(self) -> None:
         self.level_seeds: list[pd.DataFrame] = []
+        self.fixed_temperature_ratio: float | None = None
 
     def solve(
         self, *args: object, **kwargs: object
@@ -139,6 +145,274 @@ class FakePlasma:
             setattr(self, name, value)
 
 
+@pytest.mark.parametrize("stage", ["initial", "candidate", "relaxed"])
+def test_nonthermal_rejects_nonfinite_levels_at_first_boundary(
+    stage: str,
+) -> None:
+    """Report the first invalid level without another degradation solve.
+
+    A NaN in He I level 1, shell 0, or an undefined He II level fraction
+    introduced by relaxation must not be treated as zero or committed. This
+    is orchestration/error-localization verification; no physical population
+    solution is inferred from the synthetic evaluator.
+    """
+    provider = FakeNonthermalSolver()
+    plasma = FakePlasma()
+    if stage == "initial":
+        plasma.level_number_density.loc[(2, 0, 1), 0] = np.nan
+    if stage == "relaxed":
+        plasma.level_number_density.loc[(2, 1, 0), :] = 0.0
+    initial = plasma.level_number_density.copy(deep=True)
+
+    class NonfiniteEquilibriumSolver(FixedEquilibriumSolver):
+        def solve(
+            self, *args: object, **kwargs: object
+        ) -> PlasmaEquilibriumSolution:
+            solution = super().solve(*args, **kwargs)
+            if stage == "relaxed":
+                solution.evaluation.absolute_level_population.loc[
+                    (2, 1, 0), :
+                ] = 0.0
+            else:
+                solution.evaluation.absolute_level_population.loc[
+                    (2, 0, 1), 0
+                ] = np.nan
+            return solution
+
+    def evaluator_factory(*args: object) -> SimpleNamespace:
+        del args
+        return SimpleNamespace()
+
+    coupling = NonthermalHeliumPlasmaSolver(
+        provider,
+        evaluator_factory,
+        equilibrium_solver=NonfiniteEquilibriumSolver(),
+    )
+    coupling.deposition_state = DepositionState(
+        1.0 * u.s,
+        0,
+        pd.Index([0]),
+        np.ones(1) * u.erg / u.s / u.cm**3,
+        np.zeros(1) * u.erg / u.s / u.cm**3,
+        np.ones(1) * u.erg / u.s / u.cm**3,
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"Nonfinite {stage} level population.*level="
+            + (r"\(2, 1, 0\)" if stage == "relaxed" else r"\(2, 0, 1\)")
+            + r".*shell=0"
+        ),
+    ):
+        coupling.solve(
+            SimpleNamespace(
+                plasma_solver=plasma,
+                simulation_state=SimpleNamespace(t_radiative=np.array([1.0e4])),
+            )
+        )
+    assert len(provider.electron_densities) == (0 if stage == "initial" else 1)
+    assert coupling.last_result is None
+    pdt.assert_frame_equal(plasma.level_number_density, initial)
+
+
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_adaptive_ion_relaxation_removes_constant_candidate_tail(
+    adaptive: bool,
+) -> None:
+    """A stable candidate removes a trace-ion tail without changing ne damping.
+
+    Regime: a synthetic Li population moves entirely from Li I to Li II,
+    while the helium/electron root remains fixed. With alpha=0.5 the Li I
+    tail needs more than twenty steps to reach atol=1e-20 cm^-3. Verification:
+    adaptive factors [0.5, 0.5, 0.75, 0.75, 1] give exactly zero Li I in the
+    sixth input, while ne follows 4e8 - 2e8 * 0.5**k. Comparisons use exact
+    zero or rtol=1e-14 for roundoff. This verifies fixed-point orchestration,
+    not atomic rates or model performance.
+    """
+    plasma = FakePlasma()
+    plasma.number_density.loc[3] = 1.0
+    plasma.ion_number_density.loc[(3, 0), :] = 1.0
+    plasma.ion_number_density.loc[(3, 1), :] = 0.0
+    plasma.level_number_density.loc[(3, 0, 0), :] = 1.0
+    plasma.level_number_density.loc[(3, 1, 0), :] = 0.0
+    states = []
+
+    class ConstantCandidateSolver(FixedEquilibriumSolver):
+        def solve(
+            self, *args: object, **kwargs: object
+        ) -> PlasmaEquilibriumSolution:
+            solution = super().solve(*args, **kwargs)
+            solution.evaluation.ion_population.loc[(3, 0), :] = 0.0
+            solution.evaluation.ion_population.loc[(3, 1), :] = 1.0
+            solution.evaluation.absolute_level_population.loc[(3, 0, 0), :] = (
+                0.0
+            )
+            solution.evaluation.absolute_level_population.loc[(3, 1, 0), :] = (
+                1.0
+            )
+            return solution
+
+    def evaluator_factory(
+        state: CoupledPlasmaState, *args: object
+    ) -> SimpleNamespace:
+        del args
+        states.append(state)
+        return SimpleNamespace()
+
+    coupling = NonthermalHeliumPlasmaSolver(
+        FakeNonthermalSolver(),
+        evaluator_factory,
+        equilibrium_solver=ConstantCandidateSolver(),
+        settings=NonthermalCouplingSettings(adaptive_ion_relaxation=adaptive),
+    )
+    coupling.deposition_state = DepositionState(
+        1.0 * u.s,
+        0,
+        pd.Index([0]),
+        np.ones(1) * u.erg / u.s / u.cm**3,
+        np.zeros(1) * u.erg / u.s / u.cm**3,
+        np.ones(1) * u.erg / u.s / u.cm**3,
+    )
+    optical = SimpleNamespace(
+        plasma_solver=plasma,
+        simulation_state=SimpleNamespace(t_radiative=np.array([1.0e4])),
+    )
+    if adaptive:
+        result = coupling.solve(optical)
+        assert len(result.convergence_history) == 10
+        npt.assert_array_equal(states[5].ion_number_density.loc[(3, 0)], 0.0)
+        npt.assert_array_equal(
+            states[5].level_number_density.loc[(3, 0, 0)], 0.0
+        )
+    else:
+        with pytest.raises(RuntimeError, match="did not converge after 20"):
+            coupling.solve(optical)
+        npt.assert_allclose(states[-1].ion_number_density.loc[(3, 0)], 0.5**19)
+        assert coupling.last_result is None
+    history = coupling.last_ion_relaxation_history.xs(
+        (3, 0), level=["atomic_number", "shell"]
+    )
+    npt.assert_array_equal(
+        history["factor"].iloc[:5],
+        [0.5, 0.5, 0.75, 0.75, 1.0] if adaptive else [0.5] * 5,
+    )
+    for state in states:
+        npt.assert_allclose(
+            state.ion_number_density.groupby(level="atomic_number").sum(),
+            plasma.number_density.loc[[2, 3]],
+            rtol=1e-14,
+        )
+        assert (state.ion_number_density.to_numpy() >= 0.0).all()
+        level_sums = state.level_number_density.groupby(
+            level=["atomic_number", "ion_number"]
+        ).sum()
+        pdt.assert_frame_equal(
+            level_sums,
+            state.ion_number_density.reindex(level_sums.index),
+            rtol=1e-14,
+            atol=0.0,
+        )
+    npt.assert_allclose(
+        [state.electron_density[0] for state in states[:6]],
+        4.0e8 - 2.0e8 * 0.5 ** np.arange(6),
+        rtol=1e-14,
+    )
+    if adaptive:
+        coupling.solve(optical)
+        first = coupling.last_ion_relaxation_history.loc[(1, 3, 0)]
+        npt.assert_equal(first["factor"], 0.5)
+        assert first["reason"] == "initial"
+
+
+def test_ion_controller_promotes_and_backs_off_independently() -> None:
+    """Verify exact controller factors from normalized candidate trajectories.
+
+    Regime: two elements with abundances 1e9 and 1e-12 cm^-3, two reordered
+    shells, and an absent element. Stable targets promote on comparisons 2
+    and 4; material reversals and >2x growth back off to 0.25. Small reversals
+    of 1e-4 in elemental fraction must not trigger backoff. Factors/counts are
+    exact; abundance conservation allows rtol=1e-14 for floating-point sums.
+    This numerical verification detects coupling controllers across labels,
+    using raw densities, reacting to noise, and losing convex conservation.
+    """
+    densities = pd.DataFrame(
+        [[1e-12, 2e-12], [1e9, 2e9], [0.0, 0.0]],
+        index=[3, 2, 1],
+        columns=[53, 25],
+    )
+    ion_index = pd.MultiIndex.from_tuples(
+        [(3, 1), (2, 0), (1, 0), (2, 1), (3, 0), (1, 1)],
+        names=["atomic_number", "ion_number"],
+    )
+    controller = _IonRelaxationController(
+        NonthermalCouplingSettings(), densities
+    )
+    paths = {
+        (2, 53): [0.4] * 5,
+        (2, 25): [0.2, 0.4, 0.2, 0.4, 0.2],
+        (3, 53): [0.1, 0.11, 0.14, 0.15, 0.16],
+        (3, 25): [0.5, 0.5001, 0.5, 0.5001, 0.5],
+    }
+    current = pd.DataFrame(0.0, index=ion_index, columns=densities.columns)
+    for atomic_number in [1, 2, 3]:
+        current.loc[(atomic_number, 0)] = densities.loc[atomic_number]
+    history = []
+    for iteration in range(5):
+        candidate = pd.DataFrame(
+            0.0, index=ion_index, columns=densities.columns
+        )
+        for (atomic_number, shell), path in paths.items():
+            total = densities.loc[atomic_number, shell]
+            candidate.loc[(atomic_number, 0), shell] = total * path[iteration]
+            candidate.loc[(atomic_number, 1), shell] = total * (
+                1 - path[iteration]
+            )
+        original = candidate.copy(deep=True)
+        factors = controller.update(candidate)
+        history.append(controller.diagnostics.copy())
+        stage_factors = pd.DataFrame(
+            factors.reindex(
+                ion_index.get_level_values("atomic_number")
+            ).to_numpy(),
+            index=ion_index,
+            columns=densities.columns,
+        )
+        current = stage_factors * candidate + (1 - stage_factors) * current
+        npt.assert_allclose(
+            current.groupby(level="atomic_number").sum(),
+            densities.sort_index(),
+            rtol=1e-14,
+            atol=0.0,
+        )
+        assert (current.to_numpy() >= 0).all()
+        pdt.assert_frame_equal(candidate, original)
+    npt.assert_array_equal(factors.loc[[2, 3]], [[1.0, 0.25], [0.25, 1.0]])
+    assert history[2].loc[(2, 25), "reason"] == "backoff"
+    assert history[2].loc[(3, 53), "reason"] == "backoff"
+    assert history[2].loc[(3, 25), "reason"] == "promote"
+    npt.assert_array_equal(factors.loc[1], 1.0)
+    npt.assert_array_equal(
+        controller.diagnostics.loc[1, "stable_comparisons"], 0
+    )
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"minimum_ion_relaxation": 0.0},
+        {"maximum_ion_relaxation": 1.1},
+        {"ion_candidate_stability_tolerance": np.nan},
+        {"ion_stable_comparisons": 0},
+    ],
+)
+def test_adaptive_ion_settings_reject_invalid_bounds(
+    settings: dict[str, float],
+) -> None:
+    """Prevent extrapolation factors and undefined stability criteria."""
+    with pytest.raises(ValueError, match="Adaptive ion relaxation requires"):
+        NonthermalCouplingSettings(**settings)
+
+
 def test_nonthermal_rates_refresh_only_between_equilibrium_solves() -> None:
     """Refresh pynonthermal across Picard steps and commit convergence."""
     provider = FakeNonthermalSolver()
@@ -187,10 +461,465 @@ def test_nonthermal_rates_refresh_only_between_equilibrium_solves() -> None:
         optical_workflow.plasma_solver.electron_densities, [4.0e8]
     )
     assert len(result.convergence_history) == 3
+    # Nonzero targets must not be mistaken for zero-target relaxation stalls.
+    npt.assert_array_equal(
+        result.convergence_history["zero_target_level_count"], 0
+    )
+    assert coupling_solver.last_zero_target_levels.empty
     assert factory_species_filters == [(2, 0)] * 3
     for level_seed in equilibrium_solver.level_seeds:
         assert level_seed.index.equals(pd.Index([0, 1], name="level_number"))
         npt.assert_allclose(level_seed.sum(axis=0), 1.0)
+
+
+def test_nonthermal_default_prescribes_temperature_before_rate_refresh() -> (
+    None
+):
+    """Use 0.9 T_rad in pynonthermal, evaluator, relaxation, and plasma commit.
+
+    Claim: prescribing temperature applies before the first degradation solve
+    and remains exact throughout Picard relaxation. Regime: two shells whose
+    initial temperatures and synthetic thermal root disagree with 0.9 T_rad.
+    Verification: the recorded provider inputs and committed temperatures equal
+    [9000, 10800] K; the independent linear charge root is 4e8 cm^-3.
+    """
+    provider = FakeNonthermalSolver()
+    plasma = FakePlasma(shell_count=2)
+    optical_workflow = SimpleNamespace(
+        plasma_solver=plasma,
+        simulation_state=SimpleNamespace(t_radiative=np.array([1.0e4, 1.2e4])),
+    )
+    evaluators = []
+
+    class Evaluator:
+        thermal_balance_solver = object()
+
+        def evaluate(
+            self,
+            electron_density: np.ndarray,
+            electron_temperature: np.ndarray,
+            level_seed: pd.DataFrame,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                electron_residual=pd.Series(
+                    electron_density / 4.0e8 - 1.0, index=level_seed.columns
+                ),
+                fractional_heating=(
+                    None
+                    if self.thermal_balance_solver is None
+                    else pd.Series(
+                        electron_temperature / 8000.0 - 1.0,
+                        index=level_seed.columns,
+                    )
+                ),
+                normalized_population=level_seed,
+                ion_population=pd.DataFrame(
+                    [[6.0e8, 6.0e8], [4.0e8, 4.0e8]],
+                    index=plasma.ion_number_density.index,
+                    columns=level_seed.columns,
+                ),
+                absolute_level_population=pd.DataFrame(
+                    [[4.0e8, 4.0e8], [2.0e8, 2.0e8]],
+                    index=plasma.level_number_density.index,
+                    columns=level_seed.columns,
+                ),
+            )
+
+    def evaluator_factory(
+        *args: object,
+    ) -> Evaluator:
+        del args
+        evaluator = Evaluator()
+        evaluators.append(evaluator)
+        return evaluator
+
+    coupling_solver = NonthermalHeliumPlasmaSolver(
+        provider,
+        evaluator_factory,
+        settings=NonthermalCouplingSettings(
+            maximum_iterations=40, relaxation=0.5
+        ),
+    )
+    coupling_solver.deposition_state = DepositionState(
+        1.0 * u.s,
+        0,
+        plasma.number_density.columns,
+        np.ones(2) * u.erg / u.s / u.cm**3,
+        np.zeros(2) * u.erg / u.s / u.cm**3,
+        np.ones(2) * u.erg / u.s / u.cm**3,
+    )
+
+    result = coupling_solver.solve(optical_workflow)
+
+    for temperature in provider.electron_temperatures:
+        npt.assert_array_equal(temperature, [9000.0, 10800.0])
+    npt.assert_array_equal(
+        result.plasma_state.electron_temperature, [9000.0, 10800.0]
+    )
+    npt.assert_array_equal(plasma.link_t_rad_t_electron, [0.9, 0.9])
+    npt.assert_allclose(result.plasma_state.electron_density, 4.0e8, rtol=1e-7)
+    assert all(
+        evaluator.thermal_balance_solver is None for evaluator in evaluators
+    )
+    assert len(provider.electron_temperatures) > 1
+    assert (
+        (result.nonthermal_state.fixed_rates.ionization_rates > 0.0).all().all()
+    )
+
+    # The next optical iteration supplies a different radiation temperature.
+    previous_call_count = len(provider.electron_temperatures)
+    optical_workflow.simulation_state.t_radiative = np.array([8000.0, 11000.0])
+    next_result = coupling_solver.solve(optical_workflow)
+    for temperature in provider.electron_temperatures[previous_call_count:]:
+        npt.assert_array_equal(temperature, [7200.0, 9900.0])
+    npt.assert_array_equal(
+        next_result.plasma_state.electron_temperature, [7200.0, 9900.0]
+    )
+
+
+@pytest.mark.parametrize(
+    "include_heating, expected_change", [(False, 0.0), (True, 99.0)]
+)
+def test_nonthermal_heating_change_is_optional_for_convergence(
+    include_heating: bool,
+    expected_change: float,
+) -> None:
+    """A diagnostic heating change cannot block a fixed-temperature solve."""
+    ionization = pd.DataFrame([[1.0e-5]], columns=[54])
+    previous = FixedRateState(
+        ionization_rates=ionization,
+        heating_rate_density=pd.Series([1.0e-11], index=[54]),
+    )
+    candidate = FixedRateState(
+        ionization_rates=ionization,
+        heating_rate_density=pd.Series([1.0e-9], index=[54]),
+    )
+    change = NonthermalHeliumPlasmaSolver._rate_change(
+        candidate, previous, include_heating=include_heating
+    )
+    npt.assert_allclose(change, expected_change, rtol=1e-14, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("initial_population", "target_population", "accepted"),
+    [
+        (5.0e-21, 0.0, True),
+        (2.0e-20, 0.0, False),
+        (0.0, 5.0e-21, True),
+        (0.0, 2.0e-20, False),
+        (1.0e-20, 0.0, True),
+        (1.0, 1.0005, True),
+        (1.0005, 1.0, True),
+        (1.0, 1.0010005, True),
+        (1.0010005, 1.0, True),
+        (1.0, 1.002, False),
+        (1.0e-18, 1.0105e-18, True),
+        (1.0e-18, 1.012e-18, False),
+        (0.0, 0.0, True),
+    ],
+)
+def test_nonthermal_level_acceptance_uses_absolute_and_relative_tolerances(
+    initial_population: float,
+    target_population: float,
+    accepted: bool,
+) -> None:
+    """Verify mixed-tolerance acceptance independently of plasma physics.
+
+    Regime: one trace level in cm^-3, otherwise fixed equilibrium and rates.
+    The first solve preserves the seed; the second proposes the target.
+    Verification: hand-selected differences bracket atol=1e-20 cm^-3 and
+    rtol=1e-3. Small and populated limits are checked in both directions.
+    This orchestration test detects treating atol as a denominator floor or
+    accepting significant relative changes merely because a level is small.
+    """
+
+    class TraceLevelEquilibriumSolver(FixedEquilibriumSolver):
+        def solve(
+            self, *args: object, **kwargs: object
+        ) -> PlasmaEquilibriumSolution:
+            solution = super().solve(*args, **kwargs)
+            populations = solution.evaluation.absolute_level_population
+            populations.loc[(2, 0, 0)] = 6.0e8
+            populations.loc[(2, 0, 1)] = (
+                initial_population
+                if len(self.level_seeds) == 1
+                else target_population
+            )
+            return solution
+
+    plasma = FakePlasma()
+    plasma.electron_densities[:] = 4.0e8
+    plasma.t_electrons[:] = 8000.0
+    plasma.ion_number_density.loc[(2, 0)] = 6.0e8
+    plasma.ion_number_density.loc[(2, 1)] = 4.0e8
+    plasma.level_number_density.loc[(2, 0, 1)] = initial_population
+    optical_workflow = SimpleNamespace(
+        plasma_solver=plasma,
+        simulation_state=SimpleNamespace(t_radiative=np.array([1.0e4])),
+    )
+
+    def evaluator_factory(*args: object) -> SimpleNamespace:
+        del args
+        return SimpleNamespace()
+
+    coupling = NonthermalHeliumPlasmaSolver(
+        FakeNonthermalSolver(),
+        evaluator_factory,
+        equilibrium_solver=TraceLevelEquilibriumSolver(),
+        settings=NonthermalCouplingSettings(maximum_iterations=2),
+    )
+    coupling.deposition_state = DepositionState(
+        1.0 * u.s,
+        0,
+        pd.Index([0]),
+        np.ones(1) * u.erg / u.s / u.cm**3,
+        np.zeros(1) * u.erg / u.s / u.cm**3,
+        np.ones(1) * u.erg / u.s / u.cm**3,
+    )
+    if accepted:
+        coupling.solve(optical_workflow)
+        npt.assert_allclose(
+            plasma.level_number_density.loc[(2, 0, 1)],
+            target_population,
+            rtol=1e-14,
+            atol=0.0,
+        )
+    else:
+        with pytest.raises(RuntimeError, match="blocker=level_population"):
+            coupling.solve(optical_workflow)
+        assert coupling.last_result is None
+
+    last = coupling.last_convergence_history.iloc[-1]
+    assert last["failing_level_count"] == (0 if accepted else 1)
+    npt.assert_allclose(
+        coupling.last_iteration_diagnostics.loc["level_population", "change"],
+        last["level_population"],
+        rtol=1e-14,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize("target_population", [0.0, 1.0e-30])
+def test_nonthermal_selective_relaxation_removes_zero_target_tail(
+    caplog: pytest.LogCaptureFixture,
+    target_population: float,
+) -> None:
+    """Apply a vanishing level fraction without a geometric damping tail.
+
+    Regime: 50%-relaxed charge/ion updates from a trace level at 1e-8 cm^-3
+    to zero or 1e-30 cm^-3. Verification: only the first input has the large
+    trace population; later inputs use the candidate level fraction scaled
+    to the damped He I population. There is no twenty-step halving tail.
+    This is an orchestration test; it does not validate helium atomic rates.
+    """
+
+    class ZeroTargetEquilibriumSolver(FixedEquilibriumSolver):
+        def solve(
+            self, *args: object, **kwargs: object
+        ) -> PlasmaEquilibriumSolution:
+            solution = super().solve(*args, **kwargs)
+            populations = solution.evaluation.absolute_level_population
+            populations.loc[(2, 0, 0)] = 6.0e8
+            populations.loc[(2, 0, 1)] = target_population
+            return solution
+
+    plasma = FakePlasma()
+    for populations in (
+        plasma.number_density,
+        plasma.ion_number_density,
+        plasma.level_number_density,
+    ):
+        populations.columns = pd.Index([53])
+    plasma.electron_densities.index = pd.Index([53])
+    plasma.level_number_density.loc[(2, 0, 0)] = 8.0e8
+    plasma.level_number_density.loc[(2, 0, 1)] = 1.0e-8
+    optical_workflow = SimpleNamespace(
+        plasma_solver=plasma,
+        simulation_state=SimpleNamespace(t_radiative=np.array([1.0e4])),
+    )
+
+    def evaluator_factory(*args: object) -> SimpleNamespace:
+        del args
+        return SimpleNamespace()
+
+    coupling_solver = NonthermalHeliumPlasmaSolver(
+        FakeNonthermalSolver(),
+        evaluator_factory,
+        equilibrium_solver=ZeroTargetEquilibriumSolver(),
+    )
+    coupling_solver.deposition_state = DepositionState(
+        1.0 * u.s,
+        0,
+        pd.Index([53]),
+        np.ones(1) * u.erg / u.s / u.cm**3,
+        np.zeros(1) * u.erg / u.s / u.cm**3,
+        np.ones(1) * u.erg / u.s / u.cm**3,
+    )
+    caplog.set_level(
+        "INFO", logger="tardis.workflows.nonthermal_helium_workflow"
+    )
+
+    coupling_solver.solve(optical_workflow)
+
+    history = coupling_solver.last_convergence_history
+    assert len(history) < 20
+    assert history.iloc[0]["zero_target_level_count"] == 1
+    npt.assert_array_equal(history["zero_target_level_count"].iloc[1:], 0)
+    assert history.iloc[-1]["electron_density"] < 1.0e-3
+    assert history.iloc[-1]["level_population"] < 1.0e-3
+    assert "level=(2, 0, 1)" in caplog.text
+    assert "shell=53" in caplog.text
+    assert "zero/below-atol targets=1" in caplog.text
+    assert coupling_solver.last_zero_target_levels.empty
+    assert coupling_solver.last_result is not None
+    npt.assert_allclose(
+        plasma.level_number_density.loc[(2, 0, 1)],
+        target_population,
+        rtol=1e-14,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("initial_he_ii_density", "target_he_ii_density"),
+    [(2.0e8, 4.0e8), (2.0e8, 0.0), (0.0, 0.0)],
+)
+def test_nonthermal_selective_relaxation_conserves_ion_populations(
+    initial_he_ii_density: float,
+    target_he_ii_density: float,
+) -> None:
+    """Preserve ion totals while replacing level fractions without damping.
+
+    Regime: two helium ions, two levels per ion, two labelled shells, alpha=0.5.
+    Verification: the next input has midpoint ion/electron/temperature values,
+    candidate level fractions, and level sums equal to each damped ion total.
+    For a vanished candidate ion, its surviving damped population retains the
+    previous shell-specific fractions. Exact analytic fractions are compared
+    at rtol=1e-14, allowing only floating-point roundoff. This verifies the
+    update/conservation law, not the physical rate solution.
+    """
+    plasma = FakePlasma(shell_count=2)
+    shell_columns = pd.Index([25, 53])
+    plasma.number_density.columns = shell_columns
+    plasma.ion_number_density.columns = shell_columns
+    plasma.electron_densities = pd.Series(
+        [initial_he_ii_density] * 2, index=shell_columns
+    )
+    plasma.ion_number_density.loc[(2, 0)] = 1.0e9 - initial_he_ii_density
+    plasma.ion_number_density.loc[(2, 1)] = initial_he_ii_density
+    plasma.t_electrons[:] = 6000.0
+    level_index = pd.MultiIndex.from_tuples(
+        [(2, 0, 0), (2, 0, 1), (2, 1, 0), (2, 1, 1)],
+        names=["atomic_number", "ion_number", "level_number"],
+    )
+    plasma.level_number_density = pd.DataFrame(
+        [
+            [0.75 * (1.0e9 - initial_he_ii_density)] * 2,
+            [0.25 * (1.0e9 - initial_he_ii_density)] * 2,
+            [0.75 * initial_he_ii_density, 0.25 * initial_he_ii_density],
+            [0.25 * initial_he_ii_density, 0.75 * initial_he_ii_density],
+        ],
+        index=level_index,
+        columns=shell_columns,
+    )
+    original_levels = plasma.level_number_density.copy(deep=True)
+    captured_states = []
+
+    class TwoIonEquilibriumSolver(FixedEquilibriumSolver):
+        def solve(
+            self, *args: object, **kwargs: object
+        ) -> PlasmaEquilibriumSolution:
+            solution = super().solve(*args, **kwargs)
+            solution.evaluation.ion_population.loc[(2, 0)] = (
+                1.0e9 - target_he_ii_density
+            )
+            solution.evaluation.ion_population.loc[(2, 1)] = (
+                target_he_ii_density
+            )
+            solution.evaluation.absolute_level_population = pd.DataFrame(
+                np.tile(
+                    [
+                        [0.25 * (1.0e9 - target_he_ii_density)],
+                        [0.75 * (1.0e9 - target_he_ii_density)],
+                        [target_he_ii_density],
+                        [0.0],
+                    ],
+                    (1, 2),
+                ),
+                index=level_index,
+                columns=shell_columns,
+            )
+            return PlasmaEquilibriumSolution(
+                np.full(2, target_he_ii_density),
+                solution.electron_temperature,
+                solution.evaluation,
+            )
+
+    def evaluator_factory(
+        state: CoupledPlasmaState, *args: object
+    ) -> SimpleNamespace:
+        del args
+        captured_states.append(state)
+        return SimpleNamespace()
+
+    coupling = NonthermalHeliumPlasmaSolver(
+        FakeNonthermalSolver(),
+        evaluator_factory,
+        equilibrium_solver=TwoIonEquilibriumSolver(),
+        settings=NonthermalCouplingSettings(maximum_iterations=2),
+    )
+    coupling.deposition_state = DepositionState(
+        1.0 * u.s,
+        0,
+        shell_columns,
+        np.ones(2) * u.erg / u.s / u.cm**3,
+        np.zeros(2) * u.erg / u.s / u.cm**3,
+        np.ones(2) * u.erg / u.s / u.cm**3,
+    )
+    with pytest.raises(RuntimeError, match="did not converge"):
+        coupling.solve(
+            SimpleNamespace(
+                plasma_solver=plasma,
+                simulation_state=SimpleNamespace(t_radiative=np.full(2, 1.0e4)),
+            )
+        )
+    next_state = captured_states[1]
+    expected_he_i = 1.0e9 - 0.5 * (initial_he_ii_density + target_he_ii_density)
+    expected_he_ii = 0.5 * (initial_he_ii_density + target_he_ii_density)
+    npt.assert_allclose(next_state.electron_density, expected_he_ii, rtol=1e-14)
+    npt.assert_allclose(next_state.electron_temperature, 7000.0, rtol=1e-14)
+    npt.assert_allclose(
+        next_state.ion_number_density,
+        [[expected_he_i] * 2, [expected_he_ii] * 2],
+        rtol=1e-14,
+    )
+    pdt.assert_frame_equal(
+        next_state.level_number_density.groupby(
+            level=["atomic_number", "ion_number"]
+        ).sum(),
+        next_state.ion_number_density,
+        rtol=1e-14,
+    )
+    npt.assert_allclose(
+        next_state.level_number_density.loc[(2, 0)] / expected_he_i,
+        [[0.25, 0.25], [0.75, 0.75]],
+        rtol=1e-14,
+    )
+    if expected_he_ii == 0.0:
+        npt.assert_array_equal(next_state.level_number_density.loc[(2, 1)], 0.0)
+    else:
+        npt.assert_allclose(
+            next_state.level_number_density.loc[(2, 1)] / expected_he_ii,
+            (
+                [[1.0, 1.0], [0.0, 0.0]]
+                if target_he_ii_density > 0.0
+                else [[0.75, 0.25], [0.25, 0.75]]
+            ),
+            rtol=1e-14,
+            atol=0.0,
+        )
+    assert coupling.last_result is None
+    pdt.assert_frame_equal(plasma.level_number_density, original_levels)
 
 
 def test_nonthermal_solver_uses_workflow_evaluator_factory_by_default() -> None:

@@ -58,6 +58,9 @@ from tardis.plasma.equilibrium.rates.heating_cooling_rates import (
     FreeFreeThermalRates,
 )
 from tardis.plasma.equilibrium.rates.radiative_rates import RadiativeRatesSolver
+from tardis.plasma.equilibrium.rates.util import (
+    reindex_ion_population_to_level_population,
+)
 from tardis.plasma.equilibrium.solver import (
     PlasmaEquilibriumSolution,
     PlasmaEquilibriumSolver,
@@ -102,6 +105,8 @@ class OpticalPlasma(Protocol):
     t_electrons: npt.ArrayLike
     ion_number_density: pd.DataFrame
     level_number_density: pd.DataFrame
+    level_boltzmann_factor: pd.DataFrame
+    partition_function: pd.DataFrame
     number_density: pd.DataFrame
 
     def update(self, **kwargs: object) -> None:
@@ -166,12 +171,213 @@ class HighEnergySettings:
 
 @dataclass(frozen=True)
 class NonthermalCouplingSettings:
-    """Convergence and relaxation settings for the outer Picard iteration."""
+    """Convergence and relaxation settings for the outer Picard iteration.
+
+    Level populations satisfy ``abs(new - old) <= atol + rtol *
+    max(abs(new), abs(old))`` componentwise. Here ``atol`` is
+    ``absolute_population_tolerance`` in cm^-3, not a denominator floor.
+    Other quantities retain their relative or fraction-change criteria.
+    ``relaxation`` damps electron density and temperature and initializes ion
+    damping. Adaptive ion damping is enabled by default, with independent
+    factors per element/shell, bounds [0.25, 1], and two stable comparisons at
+    an elemental-fraction tolerance of 1e-3 before each promotion. New
+    within-ion level fractions are applied without damping and normalized to
+    the damped ion totals.
+    """
 
     maximum_iterations: int = 20
     relative_tolerance: float = 1.0e-3
     absolute_population_tolerance: float = 1.0e-20
     relaxation: float = 0.5
+    adaptive_ion_relaxation: bool = True
+    minimum_ion_relaxation: float = 0.25
+    maximum_ion_relaxation: float = 1.0
+    ion_candidate_stability_tolerance: float = 1.0e-3
+    ion_stable_comparisons: int = 2
+
+    def __post_init__(self) -> None:
+        """Validate the bounded adaptive-ion controller's settings."""
+        if not self.adaptive_ion_relaxation:
+            return
+        if not (
+            0.0
+            < self.minimum_ion_relaxation
+            <= self.relaxation
+            <= self.maximum_ion_relaxation
+            <= 1.0
+        ):
+            raise ValueError(
+                "Adaptive ion relaxation requires 0 < minimum <= relaxation "
+                "<= maximum <= 1."
+            )
+        if (
+            not np.isfinite(self.ion_candidate_stability_tolerance)
+            or self.ion_candidate_stability_tolerance <= 0.0
+            or self.ion_stable_comparisons < 1
+        ):
+            raise ValueError(
+                "Adaptive ion relaxation requires a positive finite candidate "
+                "stability tolerance and at least one stable comparison."
+            )
+
+
+class _IonRelaxationController:
+    """Adapt one convex mixing factor per element/shell from candidate history."""
+
+    def __init__(
+        self,
+        settings: NonthermalCouplingSettings,
+        elemental_number_density: pd.DataFrame,
+    ) -> None:
+        """Initialize candidate history independently for each coupling solve."""
+        self.settings = settings
+        self.elemental_number_density = elemental_number_density.copy(deep=True)
+        self.factors = pd.DataFrame(
+            settings.relaxation,
+            index=elemental_number_density.index,
+            columns=elemental_number_density.columns,
+        )
+        self.stable_counts = (self.factors * 0).astype(int)
+        self.previous_fractions: pd.DataFrame | None = None
+        self.previous_increment: pd.DataFrame | None = None
+        self.previous_change: pd.DataFrame | None = None
+        self.diagnostics = pd.DataFrame()
+
+    def update(self, candidate: pd.DataFrame) -> pd.DataFrame:
+        """Return bounded factors without changing candidate densities or totals.
+
+        Stability uses maximum candidate-to-candidate changes in elemental
+        number fraction. Material reversals or more-than-twofold growth
+        halve the factor; two stable comparisons promote it by 0.25. Small
+        direction reversals below the stability threshold are ignored.
+        """
+        settings = self.settings
+        reasons = pd.DataFrame(
+            "fixed", index=self.factors.index, columns=self.factors.columns
+        )
+        change = self.factors * np.nan
+        if settings.adaptive_ion_relaxation:
+            atomic_numbers = candidate.index.get_level_values("atomic_number")
+            denominators = self.elemental_number_density.reindex(
+                index=atomic_numbers, columns=candidate.columns
+            ).to_numpy(dtype=float)
+            values = candidate.to_numpy(dtype=float)
+            if (
+                not np.isfinite(values).all()
+                or not np.isfinite(denominators).all()
+                or np.any(values < 0.0)
+                or np.any((denominators == 0.0) & (values != 0.0))
+            ):
+                raise ValueError(
+                    "Adaptive ion relaxation requires finite nonnegative ion "
+                    "densities with represented, nonzero-abundance parents."
+                )
+            fractions = pd.DataFrame(
+                np.divide(
+                    values,
+                    denominators,
+                    out=np.zeros_like(values),
+                    where=denominators > 0.0,
+                ),
+                index=candidate.index,
+                columns=candidate.columns,
+            )
+            reasons[:] = "initial"
+            if self.previous_fractions is not None:
+                increment = fractions - self.previous_fractions
+                change = (
+                    increment.abs()
+                    .groupby(level="atomic_number")
+                    .max()
+                    .reindex(
+                        index=self.factors.index,
+                        columns=self.factors.columns,
+                        fill_value=0.0,
+                    )
+                )
+                stable = change <= settings.ion_candidate_stability_tolerance
+                self.stable_counts = (self.stable_counts + 1).where(stable, 0)
+                self.stable_counts = self.stable_counts.clip(
+                    upper=settings.ion_stable_comparisons
+                )
+                backoff = pd.DataFrame(
+                    False,
+                    index=self.factors.index,
+                    columns=self.factors.columns,
+                )
+                if (
+                    self.previous_increment is not None
+                    and self.previous_change is not None
+                ):
+                    dot_product = (
+                        (increment * self.previous_increment)
+                        .groupby(level="atomic_number")
+                        .sum()
+                        .reindex(
+                            index=self.factors.index,
+                            columns=self.factors.columns,
+                            fill_value=0.0,
+                        )
+                    )
+                    material = (
+                        change > settings.ion_candidate_stability_tolerance
+                    )
+                    backoff = material & (
+                        (change > 2.0 * self.previous_change)
+                        | (
+                            (dot_product < 0.0)
+                            & (
+                                self.previous_change
+                                > settings.ion_candidate_stability_tolerance
+                            )
+                        )
+                    )
+                promote = (
+                    (self.stable_counts >= settings.ion_stable_comparisons)
+                    & (self.factors < settings.maximum_ion_relaxation)
+                    & ~backoff
+                )
+                self.factors = self.factors.mask(
+                    promote,
+                    (self.factors + 0.25).clip(
+                        upper=settings.maximum_ion_relaxation
+                    ),
+                )
+                self.factors = self.factors.mask(
+                    backoff,
+                    (0.5 * self.factors).clip(
+                        lower=settings.minimum_ion_relaxation
+                    ),
+                )
+                self.stable_counts = self.stable_counts.mask(
+                    promote | backoff, 0
+                )
+                reasons[:] = "hold"
+                reasons = (
+                    reasons.mask(stable, "stable")
+                    .mask(promote, "promote")
+                    .mask(backoff, "backoff")
+                )
+                self.previous_increment = increment
+                self.previous_change = change
+            self.previous_fractions = fractions
+            absent = self.elemental_number_density == 0.0
+            self.factors = self.factors.mask(absent, 1.0)
+            self.stable_counts = self.stable_counts.mask(absent, 0)
+            reasons = reasons.mask(absent, "zero_abundance")
+        self.diagnostics = pd.DataFrame(
+            {
+                "factor": self.factors.to_numpy().ravel(),
+                "stable_comparisons": self.stable_counts.to_numpy().ravel(),
+                "candidate_change": change.to_numpy().ravel(),
+                "reason": reasons.to_numpy().ravel(),
+            },
+            index=pd.MultiIndex.from_product(
+                [self.factors.index, self.factors.columns],
+                names=["atomic_number", "shell"],
+            ),
+        )
+        return self.factors.copy(deep=True)
 
 
 @dataclass(frozen=True)
@@ -206,7 +412,27 @@ EvaluatorFactory = Callable[
 
 
 class NonthermalHeliumPlasmaSolver:
-    """Iterate pynonthermal outside frozen evaluator equilibrium solves."""
+    """Iterate pynonthermal outside frozen evaluator equilibrium solves.
+
+    Attributes
+    ----------
+    last_convergence_history : pandas.DataFrame
+        Component changes from the latest coupling attempt, including failure.
+    last_iteration_diagnostics : pandas.DataFrame
+        Worst entry for each compared quantity, measured before relaxation.
+    last_zero_target_levels : pandas.DataFrame
+        Failing level/shell entries whose nonnegative candidate population is
+        at or below the absolute tolerance. Includes the predicted relaxed
+        population and its ratio to the current population, not a new solve.
+    last_input_state : CoupledPlasmaState or None
+        Input to the latest completed equilibrium solve.
+    last_candidate_state : CoupledPlasmaState or None
+        Unrelaxed output of the latest completed equilibrium solve. A failed
+        coupling attempt does not commit this candidate to the optical plasma.
+    last_ion_relaxation_history : pandas.DataFrame
+        Factors, counters, candidate changes, and adjustment reasons indexed
+        by iteration, atomic number, and shell for the latest coupling attempt.
+    """
 
     def __init__(
         self,
@@ -227,7 +453,8 @@ class NonthermalHeliumPlasmaSolver:
             optical workflow, and optional bound-bound species filter. When
             omitted, the optical workflow owns evaluator construction.
         equilibrium_solver : PlasmaEquilibriumSolver, optional
-            Normalized charge and thermal-balance solver.
+            Normalized charge solver. The default prescribes T_e = 0.9 T_rad.
+            Pass PlasmaEquilibriumSolver() to restore coupled thermal balance.
         settings : NonthermalCouplingSettings, optional
             Picard convergence and relaxation settings.
         bound_bound_species_filter : tuple[int, int] or None, optional
@@ -237,13 +464,19 @@ class NonthermalHeliumPlasmaSolver:
         """
         self.nonthermal_solver = nonthermal_solver
         self.evaluator_factory = evaluator_factory
-        self.equilibrium_solver = (
-            equilibrium_solver or PlasmaEquilibriumSolver()
+        self.equilibrium_solver = equilibrium_solver or PlasmaEquilibriumSolver(
+            fixed_temperature_ratio=0.9
         )
         self.bound_bound_species_filter = bound_bound_species_filter
         self.settings = settings
         self.deposition_state: DepositionState | None = None
         self.last_result: NonthermalCouplingResult | None = None
+        self.last_convergence_history = pd.DataFrame()
+        self.last_iteration_diagnostics = pd.DataFrame()
+        self.last_zero_target_levels = pd.DataFrame()
+        self.last_ion_relaxation_history = pd.DataFrame()
+        self.last_input_state: CoupledPlasmaState | None = None
+        self.last_candidate_state: CoupledPlasmaState | None = None
 
     @staticmethod
     def _maximum_relative_change(
@@ -262,17 +495,72 @@ class NonthermalHeliumPlasmaSolver:
         )
 
     @staticmethod
+    def _calculate_change_diagnostic(
+        candidate: pd.Series | pd.DataFrame,
+        current: pd.Series | pd.DataFrame,
+        floor: float | None,
+        unit: str,
+        change_values: npt.NDArray[np.float64] | None = None,
+    ) -> dict[str, object]:
+        """Locate the largest pre-relaxation change using the convergence metric.
+
+        ``change_values`` supplies the mixed-tolerance level metric; otherwise
+        the original absolute or floored relative comparison is used.
+        """
+        candidate_values = candidate.to_numpy(dtype=float)
+        current_values = current.to_numpy(dtype=float)
+        absolute_change = np.abs(candidate_values - current_values)
+        if change_values is not None:
+            change = change_values
+        elif floor is None:
+            change = absolute_change
+        else:
+            change = absolute_change / np.maximum(np.abs(current_values), floor)
+        position = np.unravel_index(np.argmax(change), change.shape)
+        if isinstance(candidate, pd.DataFrame):
+            row_idx, shell_idx = position
+            state_index = candidate.index[row_idx]
+            if isinstance(state_index, tuple):
+                state_index = tuple(
+                    value.item() if isinstance(value, np.generic) else value
+                    for value in state_index
+                )
+            elif isinstance(state_index, np.generic):
+                state_index = state_index.item()
+            shell = candidate.columns[shell_idx]
+        else:
+            state_index = None
+            shell = candidate.index[position[0]]
+        if isinstance(shell, np.generic):
+            shell = shell.item()
+        return {
+            "change": float(change[position]),
+            "shell": shell,
+            "state_index": state_index,
+            "current": float(current_values[position]),
+            "candidate": float(candidate_values[position]),
+            "absolute_change": float(absolute_change[position]),
+            "floor": floor if change_values is None else None,
+            "absolute_tolerance": floor if change_values is not None else None,
+            "unit": unit,
+        }
+
+    @staticmethod
     def _rate_change(
         candidate: FixedRateState,
         previous: FixedRateState | None,
+        include_heating: bool = True,
     ) -> float:
-        """Return the largest fixed ionization or heating change."""
+        """Return the largest ionization change, optionally including heating."""
         if previous is None:
             return np.inf
         changes = []
         for candidate_rate, previous_rate in (
             (candidate.ionization_rates, previous.ionization_rates),
-            (candidate.heating_rate_density, previous.heating_rate_density),
+            (
+                candidate.heating_rate_density if include_heating else None,
+                previous.heating_rate_density if include_heating else None,
+            ),
         ):
             if candidate_rate is None and previous_rate is None:
                 continue
@@ -286,6 +574,21 @@ class NonthermalHeliumPlasmaSolver:
                 )
             )
         return max(changes, default=0.0)
+
+    @staticmethod
+    def _check_finite_level_populations(
+        levels: pd.DataFrame, stage: str
+    ) -> None:
+        """Stop at the first nonfinite level, identifying its update boundary."""
+        bad = np.argwhere(~np.isfinite(levels.to_numpy(dtype=float)))
+        if len(bad):
+            row_idx, shell_idx = bad[0]
+            level = tuple(int(value) for value in levels.index[row_idx])
+            shell = levels.columns[shell_idx]
+            raise ValueError(
+                f"Nonfinite {stage} level population: level={level}, "
+                f"shell={shell}, value={levels.iloc[row_idx, shell_idx]}."
+            )
 
     def _initial_state(
         self, optical_workflow: OpticalWorkflow
@@ -305,13 +608,30 @@ class NonthermalHeliumPlasmaSolver:
         """Converge and commit one optical iteration's helium plasma state."""
         if self.deposition_state is None:
             raise RuntimeError("High-energy deposition has not been prepared.")
+        self.last_convergence_history = pd.DataFrame()
+        self.last_iteration_diagnostics = pd.DataFrame()
+        self.last_zero_target_levels = pd.DataFrame()
+        self.last_ion_relaxation_history = pd.DataFrame()
+        self.last_input_state = None
+        self.last_candidate_state = None
         current = self._initial_state(optical_workflow)
+        self.last_input_state = current
+        self._check_finite_level_populations(
+            current.level_number_density, "initial"
+        )
         plasma = optical_workflow.plasma_solver
         shell_columns = plasma.number_density.columns
         logger.info(
             "Solving coupled nonthermal helium plasma in all %d shells: %s",
             len(shell_columns),
             shell_columns.tolist(),
+        )
+        logger.info(
+            "Selective relaxation: level fractions are undamped; "
+            "electron density and temperature use relaxation=%.3f; "
+            "adaptive ion relaxation=%s.",
+            self.settings.relaxation,
+            self.settings.adaptive_ion_relaxation,
         )
         maximum_electron_density = (
             plasma.number_density.multiply(
@@ -323,8 +643,25 @@ class NonthermalHeliumPlasmaSolver:
         complete_radiation_temperature = np.asarray(
             optical_workflow.simulation_state.t_radiative, dtype=np.float64
         )
+        temperature_ratio = self.equilibrium_solver.fixed_temperature_ratio
+        if temperature_ratio is not None:
+            current = CoupledPlasmaState(
+                current.electron_density,
+                temperature_ratio * complete_radiation_temperature,
+                current.ion_number_density,
+                current.level_number_density,
+            )
+            logger.info(
+                "Prescribing electron temperature T_e/T_rad=%.3f; "
+                "thermal balance is disabled for this helium solve.",
+                temperature_ratio,
+            )
         previous_fixed_rates = None
         convergence_rows = []
+        ion_controller = _IonRelaxationController(
+            self.settings, plasma.number_density.loc[:, shell_columns]
+        )
+        ion_relaxation_rows = []
         terminal_nonthermal = None
         terminal_solution = None
 
@@ -350,6 +687,8 @@ class NonthermalHeliumPlasmaSolver:
                     optical_workflow,
                     self.bound_bound_species_filter,
                 )
+            if temperature_ratio is not None:
+                evaluator.thermal_balance_solver = None
             he_i_level_seed = current.level_number_density.loc[(2, 0)].copy(
                 deep=True
             )
@@ -380,6 +719,67 @@ class NonthermalHeliumPlasmaSolver:
                 evaluation.ion_population,
                 evaluation.absolute_level_population,
             )
+            self.last_input_state = current
+            self.last_candidate_state = candidate
+            self._check_finite_level_populations(
+                candidate.level_number_density, "candidate"
+            )
+            relaxation = self.settings.relaxation
+            ion_factors = ion_controller.update(candidate.ion_number_density)
+            ion_relaxation_rows.append(
+                ion_controller.diagnostics.copy(deep=True)
+            )
+            self.last_ion_relaxation_history = pd.concat(
+                ion_relaxation_rows,
+                keys=range(1, iteration + 1),
+                names=["iteration"],
+            )
+            stage_factors = pd.DataFrame(
+                ion_factors.reindex(
+                    index=candidate.ion_number_density.index.get_level_values(
+                        "atomic_number"
+                    ),
+                    columns=shell_columns,
+                ).to_numpy(),
+                index=candidate.ion_number_density.index,
+                columns=shell_columns,
+            )
+            relaxed_ions = (
+                stage_factors * candidate.ion_number_density
+                + (1.0 - stage_factors) * current.ion_number_density
+            )
+            candidate_level_totals = candidate.level_number_density.groupby(
+                level=["atomic_number", "ion_number"]
+            ).transform("sum")
+            current_level_totals = current.level_number_density.groupby(
+                level=["atomic_number", "ion_number"]
+            ).transform("sum")
+            candidate_fractions = candidate.level_number_density.div(
+                candidate_level_totals.where(candidate_level_totals != 0.0)
+            )
+            # A vanished candidate ion supplies no new level distribution.
+            # Keep its previous fractions while its damped population survives.
+            candidate_fractions = candidate_fractions.mask(
+                candidate_level_totals == 0.0,
+                current.level_number_density.div(
+                    current_level_totals.where(current_level_totals != 0.0)
+                ),
+            )
+            relaxed_ion_totals = reindex_ion_population_to_level_population(
+                relaxed_ions, candidate.level_number_density, next_higher=False
+            )
+            relaxed_levels = (candidate_fractions * relaxed_ion_totals).mask(
+                relaxed_ion_totals == 0.0, 0.0
+            )
+            self._check_finite_level_populations(relaxed_levels, "relaxed")
+            relaxed_state = CoupledPlasmaState(
+                relaxation * candidate.electron_density
+                + (1.0 - relaxation) * current.electron_density,
+                relaxation * candidate.electron_temperature
+                + (1.0 - relaxation) * current.electron_temperature,
+                relaxed_ions,
+                relaxed_levels,
+            )
             density_change = self._maximum_relative_change(
                 candidate.electron_density,
                 current.electron_density,
@@ -389,11 +789,6 @@ class NonthermalHeliumPlasmaSolver:
                 candidate.electron_temperature,
                 current.electron_temperature,
                 np.finfo(float).tiny,
-            )
-            level_change = self._maximum_relative_change(
-                candidate.level_number_density,
-                current.level_number_density,
-                self.settings.absolute_population_tolerance,
             )
             candidate_helium = candidate.ion_number_density.xs(
                 2, level="atomic_number"
@@ -413,14 +808,76 @@ class NonthermalHeliumPlasmaSolver:
                 )
             )
             nonthermal_change = self._rate_change(
-                nonthermal_state.fixed_rates, previous_fixed_rates
+                nonthermal_state.fixed_rates,
+                previous_fixed_rates,
+                include_heating=temperature_ratio is None,
             )
-            maximum_change = max(
+            other_maximum_change = max(
                 density_change,
                 temperature_change,
                 he_ii_fraction_change,
-                level_change,
                 nonthermal_change,
+            )
+            current_levels = current.level_number_density.to_numpy(dtype=float)
+            candidate_levels = candidate.level_number_density.to_numpy(
+                dtype=float
+            )
+            level_absolute_change = np.abs(candidate_levels - current_levels)
+            level_allowed_change = (
+                self.settings.absolute_population_tolerance
+                + self.settings.relative_tolerance
+                * np.maximum(np.abs(current_levels), np.abs(candidate_levels))
+            )
+            # Keep the reported score on the common rtol threshold. In the
+            # populated limit this tends to the symmetric relative change.
+            level_scaled_change = self.settings.relative_tolerance * np.divide(
+                level_absolute_change,
+                level_allowed_change,
+                out=np.zeros_like(level_absolute_change),
+                where=level_allowed_change != 0.0,
+            )
+            level_change = float(np.max(level_scaled_change))
+            maximum_change = max(other_maximum_change, level_change)
+            failing_levels = (level_absolute_change > level_allowed_change) | (
+                ~np.isfinite(level_scaled_change)
+            )
+            zero_target_mask = (
+                failing_levels
+                & (candidate_levels >= 0.0)
+                & (
+                    candidate_levels
+                    <= self.settings.absolute_population_tolerance
+                )
+                & (current_levels > 0.0)
+            )
+            row_positions, shell_positions = np.nonzero(zero_target_mask)
+            target_current = current_levels[zero_target_mask]
+            target_candidate = candidate_levels[zero_target_mask]
+            relaxed_population = relaxed_levels.to_numpy(dtype=float)[
+                zero_target_mask
+            ]
+            self.last_zero_target_levels = pd.DataFrame(
+                {
+                    "state_index": list(
+                        candidate.level_number_density.index[row_positions]
+                    ),
+                    "shell": candidate.level_number_density.columns[
+                        shell_positions
+                    ],
+                    "current": target_current,
+                    "candidate": target_candidate,
+                    "absolute_change": level_absolute_change[zero_target_mask],
+                    "scaled_change": level_scaled_change[zero_target_mask],
+                    "allowed_change": level_allowed_change[zero_target_mask],
+                    "relaxed_population": relaxed_population,
+                    "relaxed_to_current_ratio": (
+                        relaxed_population / target_current
+                    ),
+                }
+            ).sort_values("absolute_change", ascending=False)
+            zero_target_count = len(self.last_zero_target_levels)
+            zero_target_absolute_change = float(
+                np.max(level_absolute_change[zero_target_mask], initial=0.0)
             )
             convergence_rows.append(
                 {
@@ -431,37 +888,208 @@ class NonthermalHeliumPlasmaSolver:
                     "level_population": level_change,
                     "nonthermal_rates": nonthermal_change,
                     "maximum_change": maximum_change,
+                    "failing_level_count": int(
+                        np.count_nonzero(failing_levels)
+                    ),
+                    "zero_target_level_count": zero_target_count,
+                    "zero_target_maximum_absolute_change": (
+                        zero_target_absolute_change
+                    ),
                 }
             )
+            self.last_convergence_history = pd.DataFrame(
+                convergence_rows
+            ).set_index("iteration")
+            comparisons = {
+                "electron_density": (
+                    pd.Series(candidate.electron_density, index=shell_columns),
+                    pd.Series(current.electron_density, index=shell_columns),
+                    np.finfo(float).tiny,
+                    "cm^-3",
+                ),
+                "electron_temperature": (
+                    pd.Series(
+                        candidate.electron_temperature, index=shell_columns
+                    ),
+                    pd.Series(
+                        current.electron_temperature, index=shell_columns
+                    ),
+                    np.finfo(float).tiny,
+                    "K",
+                ),
+                "he_ii_fraction": (
+                    candidate_he_ii_fraction,
+                    current_he_ii_fraction,
+                    None,
+                    "dimensionless",
+                ),
+                "level_population": (
+                    candidate.level_number_density,
+                    current.level_number_density,
+                    self.settings.absolute_population_tolerance,
+                    "cm^-3",
+                    level_scaled_change,
+                ),
+            }
+            if previous_fixed_rates is not None:
+                for name, new_rate, old_rate, unit in (
+                    (
+                        "nonthermal_ionization",
+                        nonthermal_state.fixed_rates.ionization_rates,
+                        previous_fixed_rates.ionization_rates,
+                        "s^-1",
+                    ),
+                    (
+                        "nonthermal_heating",
+                        nonthermal_state.fixed_rates.heating_rate_density,
+                        previous_fixed_rates.heating_rate_density,
+                        "erg s^-1 cm^-3",
+                    ),
+                ):
+                    if (
+                        name == "nonthermal_heating"
+                        and temperature_ratio is not None
+                    ):
+                        continue
+                    if (
+                        new_rate is not None
+                        and old_rate is not None
+                        and new_rate.size
+                    ):
+                        comparisons[name] = (
+                            new_rate,
+                            old_rate,
+                            np.finfo(float).tiny,
+                            unit,
+                        )
+            diagnostics = [
+                {
+                    "quantity": name,
+                    **self._calculate_change_diagnostic(*arguments),
+                }
+                for name, arguments in comparisons.items()
+            ]
+            if not np.isfinite(nonthermal_change):
+                diagnostics.append(
+                    {
+                        "quantity": "nonthermal_rates",
+                        "change": nonthermal_change,
+                        "shell": None,
+                        "state_index": None,
+                        "current": np.nan,
+                        "candidate": np.nan,
+                        "absolute_change": np.nan,
+                        "floor": None,
+                        "unit": "comparison unavailable",
+                    }
+                )
+            self.last_iteration_diagnostics = pd.DataFrame(
+                diagnostics
+            ).set_index("quantity")
+            blocker = self.last_iteration_diagnostics["change"].idxmax()
+            worst_entry = self.last_iteration_diagnostics.loc[blocker]
+            blocker_report = (
+                f"blocker={blocker}, shell={worst_entry['shell']}, "
+                f"state_index={worst_entry['state_index']}, "
+                f"current={worst_entry['current']:.6e}, "
+                f"candidate={worst_entry['candidate']:.6e}, "
+                f"absolute_change={worst_entry['absolute_change']:.6e} "
+                f"{worst_entry['unit']}"
+            )
             logger.info(
-                "Nonthermal helium iteration %d/%d: maximum change %.3e",
+                "Nonthermal helium iteration %d/%d: maximum change %.3e; "
+                "electron_density=%.3e, electron_temperature=%.3e, "
+                "He II fraction delta=%.3e, level_population=%.3e "
+                "(mixed, rtol=%.3e, atol=%.3e cm^-3), "
+                "nonthermal_rates=%.3e; %s",
                 iteration,
                 self.settings.maximum_iterations,
                 maximum_change,
+                density_change,
+                temperature_change,
+                he_ii_fraction_change,
+                level_change,
+                self.settings.relative_tolerance,
+                self.settings.absolute_population_tolerance,
+                nonthermal_change,
+                blocker_report,
             )
+            active_factors = ion_factors.to_numpy()[
+                plasma.number_density.loc[:, shell_columns].to_numpy() > 0.0
+            ]
+            if active_factors.size:
+                factor_report = "unavailable"
+                state_index = worst_entry["state_index"]
+                if (
+                    isinstance(state_index, tuple)
+                    or blocker == "he_ii_fraction"
+                ):
+                    atomic_number = (
+                        state_index[0] if isinstance(state_index, tuple) else 2
+                    )
+                    group = (atomic_number, worst_entry["shell"])
+                    if group in ion_controller.diagnostics.index:
+                        entry = ion_controller.diagnostics.loc[group]
+                        factor_report = (
+                            f"Z={group[0]}, shell={group[1]}, "
+                            f"factor={entry['factor']:.3f}, reason={entry['reason']}"
+                        )
+                reasons = ion_controller.diagnostics["reason"]
+                logger.info(
+                    "Ion relaxation iteration %d: factor min/median/max="
+                    "%.3f/%.3f/%.3f; full steps=%d/%d, promotions=%d, "
+                    "backoffs=%d; blocker factor: %s",
+                    iteration,
+                    float(np.min(active_factors)),
+                    float(np.median(active_factors)),
+                    float(np.max(active_factors)),
+                    int(np.count_nonzero(active_factors == 1.0)),
+                    active_factors.size,
+                    int((reasons == "promote").sum()),
+                    int((reasons == "backoff").sum()),
+                    factor_report,
+                )
+            if zero_target_count:
+                largest_target = self.last_zero_target_levels.iloc[0]
+                logger.info(
+                    "Nonthermal helium level diagnostic: %d failing level/shell "
+                    "entries; zero/below-atol targets=%d (atol=%.3e cm^-3); "
+                    "largest absolute zero-target discrepancy: level=%s, "
+                    "shell=%s, current=%.6e, candidate=%.6e, "
+                    "absolute_change=%.6e cm^-3, allowed_change=%.6e cm^-3, "
+                    "scaled_change=%.3e; "
+                    "predicted relaxed population=%.6e cm^-3, "
+                    "relaxed/current=%.6f (undamped level fractions, "
+                    "damped ion totals).",
+                    np.count_nonzero(failing_levels),
+                    zero_target_count,
+                    self.settings.absolute_population_tolerance,
+                    largest_target["state_index"],
+                    largest_target["shell"],
+                    largest_target["current"],
+                    largest_target["candidate"],
+                    largest_target["absolute_change"],
+                    largest_target["allowed_change"],
+                    largest_target["scaled_change"],
+                    largest_target["relaxed_population"],
+                    largest_target["relaxed_to_current_ratio"],
+                )
             terminal_nonthermal = nonthermal_state
             terminal_solution = solution
-            if maximum_change < self.settings.relative_tolerance:
+            if (
+                other_maximum_change < self.settings.relative_tolerance
+                and not np.any(failing_levels)
+            ):
                 current = candidate
                 break
-            relaxation = self.settings.relaxation
-            current = CoupledPlasmaState(
-                relaxation * candidate.electron_density
-                + (1.0 - relaxation) * current.electron_density,
-                relaxation * candidate.electron_temperature
-                + (1.0 - relaxation) * current.electron_temperature,
-                relaxation * candidate.ion_number_density
-                + (1.0 - relaxation) * current.ion_number_density,
-                relaxation * candidate.level_number_density
-                + (1.0 - relaxation) * current.level_number_density,
-            )
+            current = relaxed_state
             previous_fixed_rates = nonthermal_state.fixed_rates
         else:
             worst = convergence_rows[-1]["maximum_change"]
             raise RuntimeError(
                 "Nonthermal helium coupling did not converge after "
                 f"{self.settings.maximum_iterations} iterations; "
-                f"maximum relative change={worst:.3e}."
+                f"maximum change={worst:.3e}; {blocker_report}."
             )
 
         if terminal_nonthermal is None or terminal_solution is None:
@@ -1028,6 +1656,16 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             fixed_rates=fixed_rates,
             case_b_species=self.case_b_species,
             time_explosion=plasma.time_explosion,
+            background_level_population_fraction=(
+                plasma.level_boltzmann_factor.loc[level_index, shell_columns]
+                / reindex_ion_population_to_level_population(
+                    plasma.partition_function.loc[:, shell_columns],
+                    plasma.level_boltzmann_factor.loc[
+                        level_index, shell_columns
+                    ],
+                    next_higher=False,
+                )
+            ),
         )
 
     def build_helium_evaluator(
