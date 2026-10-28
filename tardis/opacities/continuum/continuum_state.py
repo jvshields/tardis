@@ -5,6 +5,9 @@ import numpy.typing as npt
 import pandas as pd
 
 from tardis import constants as const
+from tardis.opacities.continuum.continuum_state_numba import (
+    ContinuumOpacityStateNumba,
+)
 from tardis.plasma.array_util import cumulative_integrate_array_by_blocks
 from tardis.plasma.equilibrium.rates.heating_cooling_rates import (
     FreeFreeThermalRates,
@@ -220,6 +223,59 @@ class ContinuumOpacityState:
             photo_ion_idx,
         )
 
+    def to_numba(
+        self,
+        t_electrons: npt.NDArray[np.float64],
+        macro_atom_state: object,
+    ) -> ContinuumOpacityStateNumba:
+        """Convert continuum data to the arrays used by transport.
+
+        Parameters
+        ----------
+        t_electrons : numpy.ndarray
+            Electron temperatures in each shell [K].
+
+        Returns
+        -------
+        ContinuumOpacityStateNumba
+            Array-backed continuum data used by IIP transport.
+        """
+        continuum_arrays = (
+            self.bf_threshold_list_nu.to_numpy(),
+            np.ascontiguousarray(
+                self.p_fb_deactivation.to_numpy().copy(), dtype=np.float64
+            ),
+            self.photo_ion_nu_threshold_mins.to_numpy(),
+            self.photo_ion_nu_threshold_maxs.to_numpy(),
+            self.photo_ion_block_references,
+            self.chi_bf.to_numpy(),
+            self.x_sect.to_numpy(),
+            self.phot_nus.to_numpy(),
+            (self.ff_cooling_factor / np.sqrt(t_electrons)).astype(np.float64),
+            self.emissivities.to_numpy(),
+        )
+        if macro_atom_state.photo_ion_block_idx < 0:
+            photo_ion_activation_idx = self.photo_ion_activation_idx.to_numpy(
+                dtype=np.int64
+            )
+        else:
+            photo_ion_activation_idx = np.full(
+                len(self.level2continuum_idx),
+                macro_atom_state.photo_ion_block_idx,
+                dtype=np.int64,
+            )
+        return ContinuumOpacityStateNumba(
+            *continuum_arrays,
+            photo_ion_activation_idx,
+            np.int64(macro_atom_state.k_packet_idx),
+            (
+                np.empty((0, 0, 0), dtype=np.float64)
+                if getattr(macro_atom_state, "transition_mode", "absorbing")
+                == "direct"
+                else macro_atom_state.absorbing_probability_matrix
+            ),
+        )
+
     @property
     def bf_threshold_list_nu(self) -> pd.Series:
         """
@@ -255,7 +311,8 @@ class ContinuumOpacityState:
         return np.pad(
             self.phot_nus.groupby(level=[0, 1, 2], sort=False)
             .count()
-            .values.cumsum(),
+            .to_numpy()
+            .cumsum(),
             [1, 0],
         )
 

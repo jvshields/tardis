@@ -1,11 +1,11 @@
+import numpy as np
+import numpy.testing as npt
 import pytest
-from tardis.opacities.opacity_state import OpacityState
-from tardis.opacities.opacity_solver import OpacitySolver
+
 from tardis.opacities.macro_atom.macroatom_solver import (
     BoundBoundMacroAtomSolver,
 )
-import numpy.testing as npt
-import numpy as np
+from tardis.opacities.opacity_solver import OpacitySolver
 
 
 @pytest.mark.parametrize(
@@ -47,13 +47,14 @@ def test_opacity_state_to_numba(
         index = ...
 
     npt.assert_allclose(
-        actual.electron_density, legacy_plasma.electron_densities.values[index]
+        actual.electron_density,
+        legacy_plasma.electron_densities.to_numpy()[index],
     )
     npt.assert_allclose(
-        actual.line_list_nu, legacy_plasma.atomic_data.lines.nu.values
+        actual.line_list_nu, legacy_plasma.atomic_data.lines.nu.to_numpy()
     )
     npt.assert_allclose(
-        actual.tau_sobolev, legacy_plasma.tau_sobolevs.values[:, index]
+        actual.tau_sobolev, legacy_plasma.tau_sobolevs.to_numpy()[:, index]
     )
     if line_interaction_type == "scatter":
         empty = np.zeros(1, dtype=np.int64)

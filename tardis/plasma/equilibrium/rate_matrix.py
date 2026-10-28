@@ -85,7 +85,18 @@ class RateMatrix:
         tuple[BoundBoundMatrixRates, ...]
             Prepared transition arrays for each shell.
         """
-        radiative_rates = self.radiative_rate_solver.solve(j_blues)
+        level_names = ["level_number_lower", "level_number_upper"]
+        solver_species_index = (
+            self.radiative_rate_solver.einstein_coefficients.index.droplevel(
+                level_names
+            ).unique()
+        )
+        solver_line_idx = np.flatnonzero(
+            line_index.droplevel(level_names).isin(solver_species_index)
+        )
+        radiative_rates = self.radiative_rate_solver.solve(
+            j_blues.iloc[solver_line_idx]
+        )
         collisional_rates = self.electron_rate_solver.solve(
             thermal_electron_energy_distribution.temperature
         )
@@ -158,9 +169,14 @@ class RateMatrix:
             ],
             names=line_index.names,
         )
-        beta_line_idx = line_index.get_indexer(radiative_line_index).astype(
-            np.int64
+        solver_line_position = line_index[solver_line_idx].get_indexer(
+            radiative_line_index
         )
+        beta_line_idx = np.where(
+            solver_line_position >= 0,
+            solver_line_idx[solver_line_position],
+            -1,
+        ).astype(np.int64)
         beta_line_idx[np.all(radiative_rate_coefficients == 0.0, axis=1)] = -1
         number_of_levels = self.levels.energy.loc[species].count()
 
@@ -467,7 +483,7 @@ class AnalyticIonRateMatrix:
                 lte_ion_population, lte_level_population
             )
             level_to_continuum_saha_factor = lte_level_population / (
-                lte_ion_population.values
+                lte_ion_population.to_numpy()
                 * thermal_electron_energy_distribution.number_density.value
             )
 

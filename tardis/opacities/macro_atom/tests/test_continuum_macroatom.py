@@ -11,6 +11,7 @@ where test data is prepared in fixtures and regression data is used for validati
 ### FIX THIS TO ONLY TEST HYDROGEN FOR NOW
 # from copy import deepcopy
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,6 +19,8 @@ import pandas as pd
 import pandas.testing as pdt
 import pytest
 
+from tardis.io.atom_data import AtomData
+from tardis.opacities.continuum.continuum_state import ContinuumOpacityState
 from tardis.opacities.continuum.macro_atom_state import (
     ContinuumMacroAtomState,
 )
@@ -26,27 +29,39 @@ from tardis.opacities.macro_atom.macroatom_solver import (
 )
 from tardis.opacities.macro_atom.macroatom_state import MacroAtomState
 from tardis.opacities.opacity_state import OpacityState
-from tardis.transport.montecarlo.configuration import montecarlo_globals
 from tardis.transport.montecarlo.macro_atom import (
     MacroAtomTransitionType,
     macro_atom_interaction,
 )
 
 
+@pytest.fixture
+def continuum_atom_data(tardis_regression_path: Path) -> AtomData:
+    """Load the hydrogen atomic tables used by continuum macro-atom tests."""
+    atom_data = AtomData.from_hdf(
+        tardis_regression_path
+        / "atom_data"
+        / "christians_atomdata_converted_04Dec25.h5"
+    )
+    atom_data.prepare_atom_data([1], "macroatom", [(1, 0)], [(1, 0)])
+    atom_data.yg_data.columns = list(atom_data.collision_data_temperatures)
+    return atom_data
+
+
 @pytest.fixture(
     scope="function"
 )  # Needs to be function scope for multi-iter solve
-def continuum_macro_atom_solver(iip_atom_data):
+def continuum_macro_atom_solver(continuum_atom_data):
     """Fixture creating a ContinuumMacroAtomSolver instance.
 
     Initializes the solver with levels, lines, and photoionization data
     from the atomic dataset.
     """
     solver = ContinuumMacroAtomSolver(
-        levels=iip_atom_data.levels.loc[[1]],
-        lines=iip_atom_data.lines.loc[[1]],
-        photoionization_data=iip_atom_data.photoionization_data.loc[[1]],
-        ionization_energies=iip_atom_data.ionization_data.loc[[1]],
+        levels=continuum_atom_data.levels.loc[[1]],
+        lines=continuum_atom_data.lines.loc[[1]],
+        photoionization_data=continuum_atom_data.photoionization_data.loc[[1]],
+        ionization_energies=continuum_atom_data.ionization_data.loc[[1]],
         selected_continuum_transitions=np.array([]),
         line_interaction_type="macroatom",
     )
@@ -54,7 +69,7 @@ def continuum_macro_atom_solver(iip_atom_data):
 
 
 @pytest.fixture
-def continuum_solver_input_data(iip_atom_data):
+def continuum_solver_input_data(continuum_atom_data):
     """Fixture providing input data for solving macro-atom transitions.
 
     Creates minimal but valid input arrays and DataFrames needed for
@@ -64,14 +79,14 @@ def continuum_solver_input_data(iip_atom_data):
     # Set seed for reproducible random number generation
     np.random.seed(42)
     n_shells = 5
-    n_lines = len(iip_atom_data.lines.loc[[1]])
-    n_levels = len(iip_atom_data.levels.loc[[1]])
+    n_lines = len(continuum_atom_data.lines.loc[[1]])
+    n_levels = len(continuum_atom_data.levels.loc[[1]])
 
     # Create mean intensities for lines in blue wing
     # Shape: (n_lines, n_shells)
     mean_intensities_blue_wing = pd.DataFrame(
         np.random.uniform(0.1, 1.0, size=(n_lines, n_shells)),
-        index=iip_atom_data.lines.loc[[1]].index,
+        index=continuum_atom_data.lines.loc[[1]].index,
         columns=np.arange(n_shells),
     )
 
@@ -79,7 +94,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_lines, n_shells)
     beta_sobolevs = pd.DataFrame(
         np.random.uniform(0.1, 2.0, size=(n_lines, n_shells)),
-        index=iip_atom_data.lines.loc[[1]].index,
+        index=continuum_atom_data.lines.loc[[1]].index,
         columns=np.arange(n_shells),
     )
 
@@ -93,7 +108,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_levels-1, n_shells)
     stim_recomb_corrected_photoionization_rate_coeff = pd.DataFrame(
         np.random.uniform(1e-12, 1e-10, size=(n_levels - 1, n_shells)),
-        index=iip_atom_data.levels.xs(
+        index=continuum_atom_data.levels.xs(
             (1, 0), drop_level=False
         ).index,  # Pandas trim to only neutral H
         columns=np.arange(n_shells),
@@ -103,7 +118,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_continuum_trans, n_shells)
     spontaneous_recombination_coeff = pd.DataFrame(
         np.random.uniform(1e-13, 1e-11, size=(n_levels - 1, n_shells)),
-        index=iip_atom_data.levels.xs(
+        index=continuum_atom_data.levels.xs(
             (1, 0), drop_level=False
         ).index,  # Pandas trim to only neutral H
         columns=np.arange(n_shells),
@@ -113,7 +128,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_levels, n_shells)
     coll_deexc_coeff = pd.DataFrame(
         np.random.uniform(1e-15, 1e-12, size=(n_lines, n_shells)),
-        index=iip_atom_data.lines.loc[[1]].index,
+        index=continuum_atom_data.lines.loc[[1]].index,
         columns=np.arange(n_shells),
     )
 
@@ -121,7 +136,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_lines, n_shells)
     coll_exc_coeff = pd.DataFrame(
         np.random.uniform(1e-16, 1e-13, size=(n_lines, n_shells)),
-        index=iip_atom_data.lines.loc[[1]].index,
+        index=continuum_atom_data.lines.loc[[1]].index,
         columns=np.arange(n_shells),
     )
 
@@ -129,7 +144,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_levels - 1, n_shells)
     coll_ion_coeff = pd.DataFrame(
         np.random.uniform(1e-15, 1e-12, size=(n_levels - 1, n_shells)),
-        index=iip_atom_data.levels.xs(
+        index=continuum_atom_data.levels.xs(
             (1, 0), drop_level=False
         ).index,  # Pandas trim to only neutral H
         columns=np.arange(n_shells),
@@ -139,7 +154,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_levels-1, n_shells)
     coll_recomb_coeff = pd.DataFrame(
         np.random.uniform(1e-16, 1e-13, size=(n_levels - 1, n_shells)),
-        index=iip_atom_data.levels.xs(
+        index=continuum_atom_data.levels.xs(
             (1, 0), drop_level=False
         ).index,  # Pandas trim to only neutral H
         columns=np.arange(n_shells),
@@ -156,7 +171,7 @@ def continuum_solver_input_data(iip_atom_data):
     # Shape: (n_levels,)
     delta_E_yg = pd.Series(
         np.random.uniform(0.1, 20.0, size=n_lines),
-        index=iip_atom_data.lines.loc[[1]].index,
+        index=continuum_atom_data.lines.loc[[1]].index,
     )
 
     # Cooling rates and arrays for different processes
@@ -173,7 +188,7 @@ def continuum_solver_input_data(iip_atom_data):
 
     # Create MultiIndex for collisional excitation cooling destinations
     # Exclude ground state (0) and ionized state (n_levels - 1)
-    coll_exc_cool_destinations = iip_atom_data.levels.xs(
+    coll_exc_cool_destinations = continuum_atom_data.levels.xs(
         (1, 0), drop_level=False
     ).index[:-1]
 
@@ -283,6 +298,7 @@ def test_direct_continuum_macro_atom_retains_internal_transitions(
     ------------
     Independently sum probabilities by source and reject any absorbing solve.
     """
+
     def reject_absorbing_solve(*args: object, **kwargs: object) -> None:
         raise AssertionError("Direct mode called the absorbing-chain solver")
 
@@ -303,12 +319,8 @@ def test_direct_continuum_macro_atom_retains_internal_transitions(
             state.transition_metadata.source
         ).sum()
         active_totals = totals.loc[(totals != 0.0).any(axis=1)]
-        np.testing.assert_allclose(
-            active_totals, 1.0, rtol=1e-12, atol=1e-12
-        )
-        assert (
-            state.transition_metadata.transition_type.to_numpy() >= 0
-        ).any()
+        np.testing.assert_allclose(active_totals, 1.0, rtol=1e-12, atol=1e-12)
+        assert (state.transition_metadata.transition_type.to_numpy() >= 0).any()
         assert state.absorbing_probability_matrix is None
         assert continuum_macro_atom_solver.line_interaction_type == "macroatom"
 
@@ -317,8 +329,7 @@ def test_direct_continuum_macro_atom_compiles_for_transport(
     continuum_macro_atom_solver: ContinuumMacroAtomSolver,
     continuum_solver_input_data: dict[str, object],
     continuum_macro_atom_input_state: ContinuumMacroAtomState,
-    iip_atom_data: object,
-    monkeypatch: pytest.MonkeyPatch,
+    continuum_atom_data: AtomData,
 ) -> None:
     """The full transition table is consumable by the compiled packet walk.
 
@@ -361,17 +372,18 @@ def test_direct_continuum_macro_atom_compiles_for_transport(
     opacity_state = OpacityState(
         inputs["electron_densities"],
         np.full(shell_count, 6000.0),
-        iip_atom_data.lines.loc[[1]].nu,
+        continuum_atom_data.lines.loc[[1]].nu,
         inputs["beta_sobolevs"],
         inputs["beta_sobolevs"],
-        continuum_state,
     )
-    monkeypatch.setattr(
-        montecarlo_globals, "CONTINUUM_PROCESSES_ENABLED", True
+    numba_state = opacity_state.to_numba(
+        macro_state, "macroatom", continuum_processes_enabled=True
     )
-    numba_state = opacity_state.to_numba(macro_state, "macroatom")
+    continuum_numba = ContinuumOpacityState.to_numba(
+        continuum_state, np.full(shell_count, 6000.0), macro_state
+    )
 
-    assert numba_state.absorbing_markov_probabilities.shape == (0, 0, 0)
+    assert continuum_numba.absorbing_markov_probabilities.shape == (0, 0, 0)
     assert numba_state.transition_probabilities.shape == (
         len(macro_state.transition_metadata),
         shell_count,
@@ -420,8 +432,8 @@ class TestContinuumMacroAtomSolver:
         probs = continuum_macro_atom_state.transition_probabilities
 
         # Probabilities should be bounded [0, 1]
-        assert (probs.values >= 0).all()
-        assert (probs.values <= 1.0).all()
+        assert (probs.to_numpy() >= 0).all()
+        assert (probs.to_numpy() <= 1.0).all()
 
     def test_transition_probabilities_normalize_by_source_block(
         self, continuum_macro_atom_state: MacroAtomState
@@ -575,7 +587,7 @@ class TestContinuumMacroAtomSolver:
         probs = continuum_macro_atom_state.transition_probabilities
 
         # Check for inf
-        n_infs = np.isinf(probs.values).sum()
+        n_infs = np.isinf(probs.to_numpy()).sum()
         assert n_infs == 0, (
             f"Found {n_infs} infinite values in transition probabilities"
         )

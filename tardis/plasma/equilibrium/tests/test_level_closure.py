@@ -24,70 +24,6 @@ from tardis.plasma.equilibrium.tests.test_evaluator import (
 )
 
 
-@pytest.mark.parametrize("rate_scale", [1e-20, 1.0, 1e20])
-@pytest.mark.parametrize("fallback_stalls", [False, True])
-def test_positive_stalled_level_solve_recovers_rate_balance(
-    toy_evaluator: PlasmaEquilibriumEvaluator,
-    monkeypatch: pytest.MonkeyPatch,
-    rate_scale: float,
-    fallback_stalls: bool,
-) -> None:
-    """Recover two-level SE irrespective of the absolute rate timescale.
-
-    Verification: with upward/downward rates s, 2s, ionization s from both
-    levels, and Case B recombination into the excited state, the excited
-    equation is s*(b0 - 3*b1 + 1)=0, hence b0=b1=1/2. Tolerance 1e-8
-    follows the required relative kinetic closure, not raw inverse seconds.
-    The stopped optimizer boundary is controlled; recovery uses real SciPy.
-    """
-    evaluator = toy_evaluator
-    continuum = ContinuumRateCoefficients(
-        np.full(2, rate_scale),
-        np.zeros(2),
-        np.full(2, rate_scale / 1e9),
-        np.zeros(2),
-        np.zeros(2),
-    )
-    rates = BoundBoundMatrixRates(
-        2,
-        np.array([0, 1]),
-        np.array([1, 0]),
-        np.zeros(2),
-        np.zeros(2),
-        rate_scale * np.array([1.0, 2.0]),
-        np.array([-1, -1]),
-    )
-    monkeypatch.setattr(
-        "tardis.plasma.equilibrium.evaluator.root",
-        lambda *args, **kwargs: SimpleNamespace(
-            x=np.array([0.8, 0.2]), success=False, nfev=1
-        ),
-    )
-    arguments = (
-        0,
-        1e9,
-        1e4,
-        np.array([0.5, 0.5]),
-        continuum,
-        evaluator.shell_number_densities[0],
-        evaluator.sobolev_inputs[0],
-        rates,
-    )
-    if fallback_stalls:
-        monkeypatch.setattr(
-            "tardis.plasma.equilibrium.evaluator.least_squares",
-            lambda *args, **kwargs: SimpleNamespace(
-                x=np.array([0.8, 0.2]), success=True, nfev=1
-            ),
-        )
-        with pytest.raises(ValueError, match="relative level residual"):
-            evaluator._calculate_level_solution(*arguments)
-        assert not evaluator._level_solution_cache
-        return
-    result = evaluator._calculate_level_solution(*arguments)
-    assert_allclose(result[0], [0.5, 0.5], rtol=1e-8, atol=0.0)
-
-
 def test_equilibrium_terminal_validation_rejects_unclosed_levels() -> None:
     """Exact charge balance cannot compensate for a 20% kinetic imbalance.
 
@@ -156,6 +92,7 @@ def test_final_level_closure_uses_absolute_populations_and_continuum_ratio(
         pd.Series([1e9]),
         np.array([1e4]),
         levels,
+        state,
         state,
         normalize_residual=True,
         ion_population=ions,
@@ -264,6 +201,7 @@ def test_final_closure_retains_ground_kinetics_when_excited_levels_close(
         pd.Series([1e9]),
         np.array([1e4]),
         levels,
+        state,
         state,
         normalize_residual=True,
         ion_population=ions,

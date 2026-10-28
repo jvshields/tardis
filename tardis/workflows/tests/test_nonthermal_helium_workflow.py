@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 from astropy import units as u
 
 from tardis import constants as const
+from tardis.io.configuration.config_reader import Configuration
 from tardis.plasma.equilibrium.inputs import FixedRateState
 from tardis.plasma.equilibrium.solver import PlasmaEquilibriumSolution
 from tardis.plasma.nonthermal.pynonthermal_solver import (
@@ -1221,10 +1223,64 @@ def test_specialized_optical_workflow_uses_continuum_macro_atom() -> None:
 
     workflow.solve_opacity()
 
-    assert opacity_arguments[0][0][1] is continuum_opacity
+    # Continuum opacity is now a separate transport state, not a line input.
+    assert opacity_arguments[0][0] == (workflow.plasma_solver,)
     assert macro_atom_arguments[0][3] is continuum_rates
     assert (
         macro_atom_arguments[0][4] is workflow.plasma_solver.electron_densities
+    )
+
+
+def test_helium_evaluator_constructs_nebular_background(
+    tardis_regression_path: Path,
+) -> None:
+    """Build a real helium evaluator without running high-energy or optical MC.
+
+    This is orchestration verification on the three-shell H/He fixture. The
+    hydrogen background must receive the radiation-field nebular factor,
+    independently evaluated through the initial plasma graph, rather than
+    thermal LTE. Dilute excitation tables and physical shell labels must also
+    reach the evaluator. rtol=1e-12 allows roundoff in identical physical inputs.
+    """
+    config = Configuration.from_yaml(
+        "tardis/workflows/tests/data/iip_hydrogen_helium.yml"
+    )
+    config.atom_data = (
+        tardis_regression_path
+        / "atom_data"
+        / "christians_atomdata_converted_04Dec25.h5"
+    )
+    # The classic bootstrap has no continuum; the specialized owner adds He I.
+    config.plasma.continuum_interaction.species = []
+    workflow = NonthermalHeliumOpticalWorkflow(
+        config,
+        continuum_interaction_species=("He I",),
+        show_progress_bars=False,
+        log_level="ERROR",
+    )
+    state = workflow._current_plasma_state()
+    evaluator = workflow.build_helium_evaluator(state, FixedRateState(), (2, 0))
+    background = evaluator.dilute_radiation
+    assert background is not None
+    npt.assert_array_equal(
+        background.radiation_temperature,
+        np.asarray(workflow.plasma_solver.t_rad),
+    )
+    npt.assert_array_equal(
+        background.dilution_factor, np.asarray(workflow.plasma_solver.w)
+    )
+    pdt.assert_frame_equal(
+        background.level_boltzmann_factor,
+        workflow.plasma_solver.level_boltzmann_factor,
+    )
+    nebular = evaluator.calculate_nebular_ionization_factor(
+        state.electron_temperature
+    )
+    npt.assert_allclose(
+        nebular.loc[(1, 1)],
+        workflow.plasma_solver.phi.loc[(1, 1)],
+        rtol=1e-12,
+        atol=0.0,
     )
 
 
@@ -1236,6 +1292,7 @@ def test_specialized_optical_workflow_enables_continuum_transport() -> None:
     )
     workflow = object.__new__(NonthermalHeliumOpticalWorkflow)
     workflow.simulation_state = object()
+    workflow.continuum_opacity_state = object()
     workflow.completed_iterations = 0
     workflow.show_progress_bars = False
     workflow.transport_solver = SimpleNamespace(
@@ -1255,6 +1312,8 @@ def test_specialized_optical_workflow_enables_continuum_transport() -> None:
 
     assert initialized_with[0][1] is opacity_state
     assert initialized_with[0][2] is macro_atom_state
+    assert initialized_with[0][3] is workflow.continuum_opacity_state
+    assert initialized_with[0][4] == 1
     assert virtual_packet_energies is None
 
 

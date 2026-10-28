@@ -15,6 +15,11 @@ from tardis.util.base import quantity_linspace
 class ParsedStructure:
     """Physical data parsed from a model structure configuration.
 
+    Velocity and radius are edge-defined: N + 1 values bound N shells.
+    Density, electron density, and temperature are cell-defined: one value
+    per shell, uniform within the shell. See
+    :ref:`model-edge-cell-quantities`.
+
     Attributes
     ----------
     density_time : astropy.units.Quantity or None
@@ -24,11 +29,11 @@ class ParsedStructure:
     radius : astropy.units.Quantity or None
         Explicit shell-boundary radii.
     density : astropy.units.Quantity or None
-        File-based density values.
+        File-based density values, one per shell.
     electron_densities : astropy.units.Quantity or None
-        File-based electron-density values.
+        File-based electron-density values, one per shell.
     temperature : astropy.units.Quantity or None
-        File-based temperature values.
+        File-based temperature values, one per shell.
     """
 
     density_time: u.Quantity | None
@@ -65,6 +70,7 @@ def parse_structure_from_config(config: Configuration) -> ParsedStructure:
     radius = None
     structure_config = config.model.structure
     if structure_config.type == "specific":
+        # num shells need num + 1 edges
         velocity = quantity_linspace(
             structure_config.velocity.start,
             structure_config.velocity.stop,
@@ -197,7 +203,7 @@ def parse_velocity_from_csvy(
     velocity_unit = u.Unit(
         csvy_model_config.datatype.fields[velocity_field_idx]["unit"]
     )
-    velocity = csvy_model_data["velocity"].values * velocity_unit
+    velocity = csvy_model_data["velocity"].to_numpy() * velocity_unit
     return velocity.to("cm/s")
 
 
@@ -269,7 +275,7 @@ def parse_nonhomologous_geometry_from_csvy(
     radius_unit = u.Unit(
         csvy_model_config.datatype.fields[radius_field_idx]["unit"]
     )
-    radius = (csvy_model_data["radius"].values * radius_unit).to("cm")
+    radius = (csvy_model_data["radius"].to_numpy() * radius_unit).to("cm")
 
     return Radial1DGeometry(
         r_inner=radius[:-1],

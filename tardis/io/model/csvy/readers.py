@@ -6,13 +6,18 @@ import pandas as pd
 import yaml
 from astropy import units as u
 from radioactivedecay import Nuclide
-from radioactivedecay.utils import Z_DICT, elem_to_Z
+from radioactivedecay.utils import elem_to_Z
 
 from tardis.io.configuration.config_reader import Configuration
 from tardis.io.configuration.config_validator import validate_dict
 from tardis.io.model.csvy.data import CSVYData
 from tardis.io.util import YAMLLoader
-from tardis.util.base import is_valid_nuclide_or_elem, quantity_linspace
+from tardis.util.base import (
+    is_element_symbol,
+    is_valid_nuclide_or_elem,
+    quantity_linspace,
+    reformat_element_symbol,
+)
 
 YAML_DELIMITER = "---"
 
@@ -76,7 +81,7 @@ def load_csvy(fname: str | Path) -> CSVYData:
             yaml_dict["datatype"]["fields"][velocity_field_index]["unit"]
         )
         velocity = (
-            (csvy_data["velocity"].values * velocity_unit).to("cm/s").value
+            (csvy_data["velocity"].to_numpy() * velocity_unit).to("cm/s").value
         )
     else:
         raise ValueError("Velocity information not found in CSVY file")
@@ -94,7 +99,7 @@ def load_csvy(fname: str | Path) -> CSVYData:
             yaml_dict["datatype"]["fields"][density_field_index]["unit"]
         )
         density = (
-            (csvy_data["density"].values * density_unit).to("g/cm^3").value
+            (csvy_data["density"].to_numpy() * density_unit).to("g/cm^3").value
         )
     else:
         density = None
@@ -179,7 +184,6 @@ def load_yaml_from_csvy(fpath: str | Path) -> dict:
         raise ValueError(f"End {YAML_DELIMITER} not found")
 
 
-
 def load_csv_from_csvy(fpath: str | Path) -> pd.DataFrame | None:
     """
     Load only the CSV data from a CSVY file.
@@ -224,7 +228,8 @@ def parse_csv_mass_fractions(
     Parse the CSV data part of a CSVY model file and extract mass fractions.
 
     This function filters out columns that are not mass fractions and separates
-    elemental and isotopic mass fractions.
+    elemental and isotopic mass fractions. Element symbols are
+    case-insensitive (e.g. "si" or "Si").
 
     Parameters
     ----------
@@ -262,8 +267,8 @@ def parse_csv_mass_fractions(
     )
 
     for element_symbol_string in df.index[0:]:
-        if element_symbol_string in Z_DICT.values():
-            z = elem_to_Z(element_symbol_string)
+        if is_element_symbol(element_symbol_string):
+            z = elem_to_Z(reformat_element_symbol(element_symbol_string))
             mass_fractions.loc[z, :] = df.loc[element_symbol_string].tolist()
         else:
             nuc = Nuclide(element_symbol_string)

@@ -35,6 +35,7 @@ from tardis.plasma.equilibrium.evaluator import (
 )
 from tardis.plasma.equilibrium.inputs import (
     ContinuumCoefficientState,
+    DiluteRadiationInputs,
     FixedRateState,
     ShellNumberDensity,
     SobolevInputs,
@@ -1171,6 +1172,7 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             convergence_plots_kwargs=convergence_plots_kwargs,
             csvy=csvy,
         )
+        self.configuration = configuration
         self.case_b_species = frozenset(case_b_species)
         montecarlo_globals.CONTINUUM_PROCESSES_ENABLED = True
 
@@ -1658,6 +1660,18 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             fixed_rates=fixed_rates,
             case_b_species=self.case_b_species,
             time_explosion=plasma.time_explosion,
+            dilute_radiation=DiluteRadiationInputs(
+                np.asarray(plasma.t_rad, dtype=np.float64)[
+                    shell_positions
+                ].copy(),
+                np.asarray(plasma.w, dtype=np.float64)[shell_positions].copy(),
+                plasma.zeta_data,
+                plasma.level_boltzmann_factor.loc[:, shell_columns].copy(
+                    deep=True
+                ),
+                plasma.partition_function.loc[:, shell_columns].copy(deep=True),
+                self.configuration.plasma.get("delta_treatment", None),
+            ),
             background_level_population_fraction=(
                 plasma.level_boltzmann_factor.loc[level_index, shell_columns]
                 / reindex_ion_population_to_level_population(
@@ -1722,7 +1736,6 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             )
         opacity_state = self.opacity_solver.solve(
             self.plasma_solver,
-            self.continuum_opacity_state,
             tau_sobolev=tau_sobolev,
             beta_sobolev=beta_sobolev,
         )
@@ -1749,6 +1762,7 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
             self.simulation_state,
             opacity_states["opacity_state"],
             opacity_states["macro_atom_state"],
+            self.continuum_opacity_state,
             no_of_real_packets,
             no_of_virtual_packets=no_of_virtual_packets,
             iteration=self.completed_iterations,

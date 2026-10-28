@@ -31,7 +31,8 @@ class BoundFreeThermalRates:
         self.photoionization_block_references = np.pad(
             self.photoionization_cross_sections.nu.groupby(level=[0, 1, 2])
             .count()
-            .values.cumsum(),
+            .to_numpy()
+            .cumsum(),
             [1, 0],
         )
 
@@ -167,7 +168,7 @@ class BoundFreeThermalRates:
 
         integrated_cooling_coefficient = pd.DataFrame(
             integrate_array_by_blocks(
-                spontaneous_recombination_cooling_coefficient.values,
+                spontaneous_recombination_cooling_coefficient.to_numpy(),
                 self.nu,
                 self.photoionization_block_references,
             ),
@@ -276,7 +277,7 @@ class FreeFreeThermalRates:
             The free-free heating factor for all cells.
         """
         ionic_charge_squared = np.square(
-            ion_population.index.get_level_values(1).values
+            ion_population.index.get_level_values(1).to_numpy()
         )
         heating_factor = (
             electron_density
@@ -439,7 +440,7 @@ class CollisionalBoundThermalRates:
         lines : pd.DataFrame
             Atomic line data.
         """
-        self.nu = lines["nu"].values
+        self.nu = lines["nu"].to_numpy()
 
     def solve(
         self,
@@ -482,8 +483,8 @@ class CollisionalBoundThermalRates:
         heating_rate = (
             electron_density.cgs.value
             * (
-                collisional_deexcitation_rate_coefficient.values
-                * upper_level_number_density.values
+                collisional_deexcitation_rate_coefficient.to_numpy()
+                * upper_level_number_density.to_numpy()
                 * self.nu.reshape(-1, 1)  # handle broadcasting
                 * const.h.cgs.value
             )
@@ -495,8 +496,8 @@ class CollisionalBoundThermalRates:
         cooling_rate = (
             electron_density.cgs.value
             * (
-                collisional_excitation_rate_coefficient.values
-                * lower_level_number_density.values
+                collisional_excitation_rate_coefficient.to_numpy()
+                * lower_level_number_density.to_numpy()
                 * self.nu.reshape(-1, 1)  # handle broadcasting
                 * const.h.cgs.value
             )

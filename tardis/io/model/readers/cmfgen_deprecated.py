@@ -23,6 +23,12 @@ def read_cmfgen_density(fname: str):
 
     Rest columns contain abundances of elements and isotopes
 
+    CMFGEN tabulates quantities at radial grid points. TARDIS uses each grid
+    point velocity as the outer edge of a shell and assigns the density,
+    electron density, and temperature at that grid point to the whole shell
+    inside it. This is a piecewise-constant reconstruction, not a shell
+    average. See :ref:`model-edge-cell-quantities`.
+
     Parameters
     ----------
     fname : str
@@ -51,11 +57,11 @@ def read_cmfgen_density(fname: str):
             elif row_index == 2:
                 quantities = line.split()
 
-    velocity = u.Quantity(df["velocity"].values, quantities[1]).to("cm/s")
-    temperature = u.Quantity(df["temperature"].values, quantities[2])[1:]
-    mean_density = u.Quantity(df["densities"].values, quantities[3])[1:]
+    velocity = u.Quantity(df["velocity"].to_numpy(), quantities[1]).to("cm/s")
+    temperature = u.Quantity(df["temperature"].to_numpy(), quantities[2])[1:]
+    mean_density = u.Quantity(df["densities"].to_numpy(), quantities[3])[1:]
     electron_densities = u.Quantity(
-        df["electron_densities"].values, quantities[4]
+        df["electron_densities"].to_numpy(), quantities[4]
     )[1:]
 
     return (
