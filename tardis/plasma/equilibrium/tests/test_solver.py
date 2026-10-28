@@ -146,6 +146,171 @@ def test_prescribed_temperature_still_requires_charge_closure() -> None:
         )
 
 
+@pytest.mark.parametrize("fixed_temperature_ratio", [None, 0.9])
+def test_terminal_refinement_reoptimizes_changed_outer_root(
+    fixed_temperature_ratio: float | None,
+) -> None:
+    """Resume the same outer objective after a terminal context changes it.
+
+    This is orchestration verification: refinement moves a prescribed charge
+    root from 2e9 to 3e9 cm^-3 and a thermal root from 8000 to 8500 K.
+    The accepted arrays must match the exact evaluation producing the terminal
+    diagnostics. Kinetic correctness is tested with the real three-stage atom.
+    """
+
+    class RefiningEvaluator:
+        level_residual_tolerance = 1e-8
+
+        def __init__(self) -> None:
+            self.refined = False
+            self.refinements = 0
+
+        def evaluate(
+            self,
+            electron_density: npt.NDArray[np.float64],
+            electron_temperature: npt.NDArray[np.float64],
+            level_seed: pd.DataFrame,
+        ) -> SimpleNamespace:
+            density_root = 3e9 if self.refined else 2e9
+            temperature_root = 8500.0 if self.refined else 8000.0
+            return SimpleNamespace(
+                electron_residual=pd.Series(
+                    electron_density / density_root - 1
+                ),
+                fractional_heating=pd.Series(
+                    electron_temperature / temperature_root - 1
+                ),
+                normalized_population=level_seed,
+                relative_level_residual=pd.DataFrame(
+                    [[0.0 if self.refined else 0.1]]
+                ),
+                density=electron_density.copy(),
+                temperature=electron_temperature.copy(),
+            )
+
+        def refine_terminal(
+            self,
+            electron_density: npt.NDArray[np.float64],
+            electron_temperature: npt.NDArray[np.float64],
+            previous: SimpleNamespace,
+        ) -> SimpleNamespace:
+            self.refined = True
+            self.refinements += 1
+            return self.evaluate(
+                electron_density,
+                electron_temperature,
+                previous.normalized_population,
+            )
+
+    evaluator = RefiningEvaluator()
+    solution = PlasmaEquilibriumSolver(
+        fixed_temperature_ratio=fixed_temperature_ratio
+    ).solve(
+        evaluator,
+        [1e9],
+        [7000.0],
+        pd.DataFrame([[1.0]]),
+        [1e10],
+        [1e4],
+    )
+    npt.assert_allclose(solution.electron_density, [3e9], rtol=1e-10)
+    npt.assert_allclose(
+        solution.electron_temperature,
+        [8500.0 if fixed_temperature_ratio is None else 9000.0],
+        rtol=1e-10,
+    )
+    npt.assert_array_equal(
+        solution.electron_density, solution.evaluation.density
+    )
+    npt.assert_array_equal(
+        solution.electron_temperature, solution.evaluation.temperature
+    )
+    assert evaluator.refinements == 1
+
+
+def test_terminal_refinement_rejects_unrepairable_levels_after_finite_passes() -> (
+    None
+):
+    """Three ineffective context refinements cannot bypass terminal closure."""
+
+    class UnrepairableEvaluator:
+        level_residual_tolerance = 1e-8
+
+        def __init__(self) -> None:
+            self.refinements = 0
+
+        def evaluate(
+            self,
+            electron_density: npt.NDArray[np.float64],
+            electron_temperature: npt.NDArray[np.float64],
+            level_seed: pd.DataFrame,
+        ) -> SimpleNamespace:
+            del electron_temperature
+            return SimpleNamespace(
+                electron_residual=pd.Series(np.zeros_like(electron_density)),
+                normalized_population=level_seed,
+                relative_level_residual=pd.DataFrame([[0.2]]),
+            )
+
+        def refine_terminal(
+            self,
+            electron_density: npt.NDArray[np.float64],
+            electron_temperature: npt.NDArray[np.float64],
+            previous: SimpleNamespace,
+        ) -> SimpleNamespace:
+            self.refinements += 1
+            return self.evaluate(
+                electron_density,
+                electron_temperature,
+                previous.normalized_population,
+            )
+
+    evaluator = UnrepairableEvaluator()
+    with pytest.raises(RuntimeError, match="relative level residual"):
+        PlasmaEquilibriumSolver(fixed_temperature_ratio=0.9).solve(
+            evaluator,
+            [1e9],
+            [9000.0],
+            pd.DataFrame([[1.0]]),
+            [1e10],
+            [1e4],
+        )
+    assert evaluator.refinements == 3
+
+
+def test_terminal_validation_checks_reconstructed_charge() -> None:
+    """A density root cannot hide non-neutral returned ion populations.
+
+    This is acceptance wiring: both outer equations vanish, but the supplied
+    normalized nuclear charge discrepancy is 1e-3, exceeding 1e-7.
+    """
+
+    class NonNeutralEvaluator(AnalyticEvaluator):
+        def evaluate(
+            self,
+            electron_density: npt.NDArray[np.float64],
+            electron_temperature: npt.NDArray[np.float64],
+            level_seed: pd.DataFrame,
+        ) -> SimpleNamespace:
+            result = super().evaluate(
+                electron_density, electron_temperature, level_seed
+            )
+            result.charge_residual = pd.Series([1e-3])
+            return result
+
+    with pytest.raises(
+        RuntimeError, match="did not close its normalized residuals"
+    ):
+        PlasmaEquilibriumSolver().solve(
+            NonNeutralEvaluator(),
+            [1e9],
+            [7000.0],
+            pd.DataFrame([[1.0]]),
+            [1e10],
+            [1e4],
+        )
+
+
 def test_equilibrium_solver_reports_residual_evaluation_progress(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

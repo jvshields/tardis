@@ -809,7 +809,13 @@ class PlasmaEquilibriumEvaluator:
         npt.NDArray[np.float64],
         npt.NDArray[np.float64],
     ]:
-        """Solve one shell's normalized reduced level equations."""
+        """Solve dimensionless level equations, retaining the best physical trial.
+
+        Every candidate is ranked on all physical kinetic rows, including the
+        ground equation omitted from the reduced root. Intermediate trials may
+        return a finite nonnegative best effort; terminal acceptance remains
+        the responsibility of the outer solver.
+        """
         if bound_bound_rates is None:
             shell_j_blues = self.j_blues.iloc[:, [shell_idx]].copy()
             shell_j_blues.columns = pd.RangeIndex(1)
@@ -828,53 +834,62 @@ class PlasmaEquilibriumEvaluator:
                 else self.fixed_rates.bound_bound_rates,
             )[0]
 
+        level_solution: npt.NDArray[np.float64] | None = None
+        best_residual = np.inf
+
         def residual(
             level_fractions: npt.NDArray[np.float64],
         ) -> npt.NDArray[np.float64]:
-            return self._calculate_level_state(
+            nonlocal level_solution, best_residual
+            total_fraction = level_fractions.sum()
+            fractions = (
+                level_fractions / total_fraction
+                if total_fraction > 0.0
+                else level_fractions
+            )
+            physical_residual = self._calculate_level_state(
                 shell_idx,
                 electron_density,
                 electron_temperature,
-                level_fractions,
+                fractions,
                 continuum_rates,
                 population_geometry,
                 sobolev_inputs,
                 bound_bound_rates=bound_bound_rates,
+                normalize_residual=True,
+                replace_normalization_row=False,
             )[0]
-
-        def calculate_physical_level_residual(
-            candidate: npt.NDArray[np.float64],
-        ) -> float:
             if (
-                not np.isfinite(candidate).all()
-                or np.any(candidate < 0.0)
-                or candidate.sum() <= 0.0
+                total_fraction > 0.0
+                and np.isfinite(fractions).all()
+                and np.all(fractions >= 0.0)
+                and np.isfinite(physical_residual).all()
             ):
-                return np.inf
-            candidate_residual = residual(candidate / candidate.sum())
-            if not np.isfinite(candidate_residual).all():
-                return np.inf
-            return float(np.max(np.abs(candidate_residual)))
+                candidate_residual = float(np.max(np.abs(physical_residual)))
+                if candidate_residual < best_residual:
+                    level_solution = fractions.copy()
+                    best_residual = candidate_residual
+            physical_residual[0] = total_fraction - 1.0
+            return physical_residual
 
         # An empirical per-level floor lets a retry repopulate excited levels
         # depleted by the previous thermal state while retaining its shape.
         floored_seed = np.maximum(level_seed, 1e-4)
         floored_seed /= floored_seed.sum()
-        level_solution = level_seed
-        best_residual = np.inf
-        for seed_idx, trial_seed in enumerate((level_seed, floored_seed)):
+        # Leave a factor-ten margin for the reconstructed ground equation and
+        # subsequent ion/opacity coupling, without changing acceptance scaling.
+        inner_target = 0.1 * self.level_residual_tolerance
+        residual(level_seed)
+        for trial_seed in (level_seed, floored_seed):
             root_solution = root(
                 residual, trial_seed, options={"xtol": 1e-12}
             ).x
-            root_residual = calculate_physical_level_residual(root_solution)
-            if seed_idx == 0 or root_residual < best_residual:
-                level_solution = root_solution
-                best_residual = root_residual
-            if best_residual <= 1e-10:
+            residual(root_solution)
+            if best_residual <= inner_target:
                 break
 
             # Log ratios preserve positive, normalized populations while
-            # solving from this trial seed.
+            # warm starting from the best physical iterate seen by HYBR.
             def calculate_log_ratio_residual(
                 log_ratios: npt.NDArray[np.float64],
             ) -> npt.NDArray[np.float64]:
@@ -883,9 +898,10 @@ class PlasmaEquilibriumEvaluator:
                 ]
 
             minimum_fraction = np.finfo(np.float64).eps
+            log_seed = trial_seed if level_solution is None else level_solution
             initial_log_ratios = np.log(
-                np.maximum(trial_seed[1:], minimum_fraction)
-                / max(trial_seed[0], minimum_fraction)
+                np.maximum(log_seed[1:], minimum_fraction)
+                / max(log_seed[0], minimum_fraction)
             )
             log_solution = least_squares(
                 calculate_log_ratio_residual,
@@ -896,12 +912,13 @@ class PlasmaEquilibriumEvaluator:
                 max_nfev=3000,
             )
             log_fractions = softmax(np.concatenate(([0.0], log_solution.x)))
-            log_residual = calculate_physical_level_residual(log_fractions)
-            if log_residual < best_residual:
-                level_solution = log_fractions
-                best_residual = log_residual
-            if best_residual <= 1e-10:
+            residual(log_fractions)
+            if best_residual <= inner_target:
                 break
+        if level_solution is None:
+            raise ValueError(
+                "Reduced level-population solve returned no physical candidate."
+            )
         if not np.isfinite(level_solution).all():
             raise ValueError(
                 "Reduced level-population solve returned nonfinite fractions."
@@ -1424,6 +1441,75 @@ class PlasmaEquilibriumEvaluator:
             total_heating,
             fractional_heating,
             thermal_budget,
+        )
+
+    def refine_terminal(
+        self,
+        electron_density: npt.NDArray[np.float64],
+        electron_temperature: npt.NDArray[np.float64],
+        previous_evaluation: PlasmaEquilibriumEvaluation,
+    ) -> PlasmaEquilibriumEvaluation:
+        """Refine levels using the authoritative terminal population geometry.
+
+        Parameters
+        ----------
+        electron_density : numpy.ndarray
+            Trial electron number densities [cm^-3].
+        electron_temperature : numpy.ndarray
+            Trial electron temperatures [K].
+        previous_evaluation : PlasmaEquilibriumEvaluation
+            Terminal snapshot whose absolute populations and ion totals supply
+            the new Sobolev geometry and charge-solver seed. The snapshot is
+            not mutated. The refreshed context remains fixed during any
+            subsequent outer density-temperature optimization.
+
+        Returns
+        -------
+        PlasmaEquilibriumEvaluation
+            Reconstructed levels, ions, opacities and physical residuals.
+        """
+        ions = previous_evaluation.ion_population
+        species = self.equilibrium_species
+        upper_species = (species[0], species[1] + 1)
+        geometries = []
+        for shell_idx, geometry in enumerate(self.shell_number_densities):
+            if ions is None:
+                neutral_density = (
+                    previous_evaluation.absolute_level_population.loc[
+                        previous_evaluation.normalized_population.index
+                    ]
+                    .iloc[:, shell_idx]
+                    .sum()
+                )
+                species_density = neutral_density * (
+                    1.0
+                    + previous_evaluation.diagnostic_ion_ratio.iloc[shell_idx]
+                )
+            else:
+                # The eliminated continuum describes only this adjacent pair.
+                # Higher stages (e.g. He III) must not inflate neutral opacity.
+                species_density = float(
+                    ions.loc[[species, upper_species]].iloc[:, shell_idx].sum()
+                )
+            geometries.append(
+                ShellNumberDensity(
+                    float(species_density),
+                    previous_evaluation.absolute_level_population.iloc[
+                        :, shell_idx
+                    ].to_numpy(dtype=np.float64, copy=True),
+                    geometry.species_level_positions,
+                )
+            )
+        self.shell_number_densities = tuple(geometries)
+        if ions is not None:
+            self.ion_population_arguments = {
+                **self.ion_population_arguments,
+                "estimated_ion_population": ions.copy(deep=True),
+            }
+        return self.evaluate(
+            electron_density,
+            electron_temperature,
+            previous_evaluation.normalized_population,
         )
 
     def evaluate(

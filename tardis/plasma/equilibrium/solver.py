@@ -97,6 +97,11 @@ class PlasmaEquilibriumSolver:
     ) -> PlasmaEquilibriumSolution:
         """Solve charge and optionally thermal residuals with fixed rate inputs.
 
+        Intermediate level solves may return physical best-effort candidates.
+        If terminal kinetic closure fails, refresh the evaluator's population
+        context up to three times and reoptimize charge/temperature as needed.
+        All terminal tolerances still apply to the exact returned state.
+
         Parameters
         ----------
         evaluator : EquilibriumEvaluator
@@ -160,6 +165,7 @@ class PlasmaEquilibriumSolver:
             format="csr",
         )
         residual_evaluation_count = 0
+        optimization_evaluation_start = 0
         previous_optimizer_candidate = initial_guess.copy()
         previous_optimizer_cost = np.nan
         thermal_budgets: dict[bytes, pd.DataFrame] = {}
@@ -195,7 +201,7 @@ class PlasmaEquilibriumSolver:
                 trial_cost = float(
                     0.5 * np.dot(electron_residual, electron_residual)
                 )
-                if evaluation_idx == 1:
+                if evaluation_idx == optimization_evaluation_start + 1:
                     previous_optimizer_cost = trial_cost
                 logger.debug(
                     "Finished plasma equilibrium residual evaluation %d in %.3f s "
@@ -222,7 +228,7 @@ class PlasmaEquilibriumSolver:
             charge_shell_idx = int(np.argmax(np.abs(electron_residual)))
             thermal_shell_idx = int(np.argmax(np.abs(thermal_residual)))
             trial_cost = float(0.5 * np.dot(result, result))
-            if evaluation_idx == 1:
+            if evaluation_idx == optimization_evaluation_start + 1:
                 previous_optimizer_cost = trial_cost
             logger.debug(
                 "Finished plasma equilibrium residual evaluation %d in %.3f "
@@ -359,34 +365,44 @@ class PlasmaEquilibriumSolver:
             previous_optimizer_candidate = intermediate_result.x.copy()
             previous_optimizer_cost = float(intermediate_result.cost)
 
-        least_squares_start_time = perf_counter()
-        root = least_squares(
-            residual,
-            initial_guess,
-            bounds=(lower_bound, upper_bound),
-            xtol=1e-12,
-            ftol=1e-12,
-            gtol=1e-12,
-            max_nfev=self.maximum_function_evaluations,
-            method="trf",
-            jac_sparsity=jacobian_sparsity,
-            callback=report_optimizer_step,
-        )
-        logger.info(
-            "Finished plasma equilibrium least-squares optimization in %.3f "
-            "s (residual evaluations=%d, nfev=%d, njev=%s, cost=%.3e, "
-            "status=%d).",
-            perf_counter() - least_squares_start_time,
-            residual_evaluation_count,
-            root.nfev,
-            root.njev,
-            root.cost,
-            root.status,
-        )
-        if not root.success:
-            raise RuntimeError(
-                "Plasma equilibrium solve failed: " + root.message
+        def optimize(candidate: npt.NDArray[np.float64]) -> OptimizeResult:
+            nonlocal previous_optimizer_candidate, previous_optimizer_cost
+            nonlocal optimization_evaluation_start
+            optimization_evaluation_start = residual_evaluation_count
+            previous_optimizer_candidate = candidate.copy()
+            previous_optimizer_cost = np.nan
+            thermal_budgets.clear()
+            least_squares_start_time = perf_counter()
+            result = least_squares(
+                residual,
+                candidate,
+                bounds=(lower_bound, upper_bound),
+                xtol=1e-12,
+                ftol=1e-12,
+                gtol=1e-12,
+                max_nfev=self.maximum_function_evaluations,
+                method="trf",
+                jac_sparsity=jacobian_sparsity,
+                callback=report_optimizer_step,
             )
+            logger.info(
+                "Finished plasma equilibrium least-squares optimization in %.3f "
+                "s (residual evaluations=%d, nfev=%d, njev=%s, cost=%.3e, "
+                "status=%d).",
+                perf_counter() - least_squares_start_time,
+                residual_evaluation_count,
+                result.nfev,
+                result.njev,
+                result.cost,
+                result.status,
+            )
+            if not result.success:
+                raise RuntimeError(
+                    "Plasma equilibrium solve failed: " + result.message
+                )
+            return result
+
+        root = optimize(initial_guess)
         electron_density = maximum_density * root.x[::variable_stride]
         electron_temperature = (
             radiation_temperature * root.x[1::2]
@@ -404,6 +420,97 @@ class PlasmaEquilibriumSolver:
             electron_temperature,
             seed_evaluation.normalized_population,
         )
+        terminal_evaluation_count = 2
+        level_tolerance = getattr(
+            evaluator, "level_residual_tolerance", self.residual_tolerance
+        )
+        # Three refreshed contexts allow a terminal opacity/ion correction and
+        # confirmation while bounding unresolved fixed-point iteration. Each
+        # pass retains the existing full inner and outer optimizer effort.
+        refine_terminal = getattr(evaluator, "refine_terminal", None)
+        refinement_count = 0
+        for refinement_pass in range(1, 4):
+            relative_levels = getattr(
+                terminal_evaluation, "relative_level_residual", None
+            )
+            if relative_levels is None or refine_terminal is None:
+                break
+            level_values = np.asarray(relative_levels, dtype=np.float64)
+            before_residual = float(np.max(np.abs(level_values)))
+            if (
+                np.isfinite(level_values).all()
+                and before_residual <= level_tolerance
+            ):
+                break
+            level_idx, shell_idx = np.unravel_index(
+                np.argmax(np.abs(level_values)), level_values.shape
+            )
+            logger.info(
+                "Starting terminal level refinement %d/3: level %s, shell %s, "
+                "relative residual %.3e (tolerance %.3e).",
+                refinement_pass,
+                relative_levels.index[level_idx],
+                relative_levels.columns[shell_idx],
+                before_residual,
+                level_tolerance,
+            )
+            refinement_count = refinement_pass
+            terminal_evaluation = refine_terminal(
+                electron_density, electron_temperature, terminal_evaluation
+            )
+            terminal_evaluation_count += 1
+            level_seed = terminal_evaluation.normalized_population
+            outer_residual = np.asarray(
+                terminal_evaluation.electron_residual, dtype=np.float64
+            )
+            if prescribed_temperature is None:
+                outer_residual = np.concatenate(
+                    [
+                        outer_residual,
+                        np.asarray(
+                            terminal_evaluation.fractional_heating,
+                            dtype=np.float64,
+                        ),
+                    ]
+                )
+            if not np.isfinite(outer_residual).all() or np.max(
+                np.abs(outer_residual)
+            ) > min(self.residual_tolerance, 0.1 * level_tolerance):
+                # Refreshing physical levels can shift the charge/thermal root.
+                # Reoptimize the same coordinates/objective, with no kinetic
+                # rows added and the same independent-shell Jacobian pattern.
+                candidate = np.empty_like(initial_guess)
+                candidate[::variable_stride] = (
+                    electron_density / maximum_density
+                )
+                if prescribed_temperature is None:
+                    candidate[1::2] = (
+                        electron_temperature / radiation_temperature
+                    )
+                root = optimize(np.clip(candidate, lower_bound, upper_bound))
+                electron_density = maximum_density * root.x[::variable_stride]
+                electron_temperature = (
+                    radiation_temperature * root.x[1::2]
+                    if prescribed_temperature is None
+                    else prescribed_temperature
+                )
+                terminal_evaluation = evaluator.evaluate(
+                    electron_density, electron_temperature, level_seed
+                )
+                terminal_evaluation_count += 1
+            after_levels = np.asarray(
+                terminal_evaluation.relative_level_residual, dtype=np.float64
+            )
+            after_residual = float(np.max(np.abs(after_levels)))
+            logger.info(
+                "Finished terminal level refinement %d/3: relative residual "
+                "%.3e -> %.3e; level acceptance=%s.",
+                refinement_pass,
+                before_residual,
+                after_residual,
+                np.isfinite(after_levels).all()
+                and after_residual <= level_tolerance,
+            )
         terminal_residual = np.asarray(
             terminal_evaluation.electron_residual, dtype=np.float64
         )
@@ -415,6 +522,14 @@ class PlasmaEquilibriumSolver:
                         terminal_evaluation.fractional_heating,
                         dtype=np.float64,
                     ),
+                ]
+            )
+        charge_residual = getattr(terminal_evaluation, "charge_residual", None)
+        if charge_residual is not None:
+            terminal_residual = np.concatenate(
+                [
+                    terminal_residual,
+                    np.asarray(charge_residual, dtype=np.float64),
                 ]
             )
         if not np.all(np.isfinite(terminal_residual)):
@@ -433,9 +548,6 @@ class PlasmaEquilibriumSolver:
         )
         if relative_level_residual is not None:
             level_values = np.asarray(relative_level_residual, dtype=np.float64)
-            level_tolerance = getattr(
-                evaluator, "level_residual_tolerance", self.residual_tolerance
-            )
             if (
                 not np.isfinite(level_values).all()
                 or np.max(np.abs(level_values)) > level_tolerance
@@ -448,14 +560,15 @@ class PlasmaEquilibriumSolver:
                     f"residual at level {relative_level_residual.index[level_idx]}, "
                     f"shell {relative_level_residual.columns[shell_idx]}: "
                     f"{level_values[level_idx, shell_idx]:.3e} "
-                    f"(tolerance={level_tolerance:.3e})."
+                    f"(tolerance={level_tolerance:.3e}, "
+                    f"terminal refinements={refinement_count})."
                 )
         logger.info(
             "Finished plasma equilibrium terminal validation in %.3f s "
             "after %d total evaluator calls (maximum residual %.3e; total "
             "solve time %.3f s).",
             perf_counter() - terminal_validation_start_time,
-            residual_evaluation_count + 2,
+            residual_evaluation_count + terminal_evaluation_count,
             maximum_residual,
             perf_counter() - solve_start_time,
         )

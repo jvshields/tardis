@@ -530,7 +530,7 @@ def test_evaluator_reports_open_level_solution_after_all_retries(
         0,
         1.0e9,
         1.0e4,
-        np.array([0.5, 0.5]),
+        stalled_fractions.copy(),
         continuum_rates,
         evaluator.shell_number_densities[0],
         evaluator.sobolev_inputs[0],
