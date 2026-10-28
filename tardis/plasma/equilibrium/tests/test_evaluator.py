@@ -502,19 +502,18 @@ def test_evaluator_finds_same_unique_root_from_distinct_initial_guesses(
     )
 
 
-def test_evaluator_accepts_physical_level_iterate_when_optimizer_stalls(
+def test_evaluator_recovers_physical_level_iterate_when_optimizer_stalls(
     toy_evaluator: PlasmaEquilibriumEvaluator,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Accept a physical population when the level solver stops early.
+    """Recover a closed population when the level solver stops early.
 
-    Claim: A finite, nonnegative, normalized population remains usable when
-    the level solver reports failure.
+    Claim: A finite, nonnegative, normalized population is only usable when
+    the kinetic equations close, regardless of the solver's status.
     Regime: One shell and two neutral-hydrogen levels at fixed density and
     temperature.
-    Verification: Population conservation and a deliberately nonzero level
-    balance error show that acceptance depends on physical admissibility, not
-    reported convergence.
+    Verification: Population conservation and a vanishing kinetic imbalance
+    distinguish recovered equilibrium from the supplied stopped endpoint.
     """
     evaluator = toy_evaluator
     continuum_rates = evaluator.calculate_continuum_coefficients(
@@ -545,10 +544,10 @@ def test_evaluator_accepts_physical_level_iterate_when_optimizer_stalls(
     )
     actual = evaluator._calculate_level_solution(*arguments)
 
-    npt.assert_array_equal(actual[0], stalled_fractions)
+    assert not np.allclose(actual[0], stalled_fractions)
     assert actual[0].sum() == 1.0
     assert np.all(actual[0] >= 0.0)
-    assert np.max(np.abs(actual[3])) > 1e-10
+    npt.assert_allclose(actual[3], 0.0, rtol=0.0, atol=1e-8)
 
 
 def test_level_fallback_starts_from_best_feasible_root_evaluation(
@@ -686,7 +685,6 @@ def test_level_solution_warm_starts_next_shell_solve(
         np.array([1.0e4])
     )[0][0]
     supplied_seed = np.array([0.5, 0.5])
-    accepted_solution = np.array([0.3, 0.7])
     arguments = (
         0,
         1.0e9,
@@ -696,6 +694,8 @@ def test_level_solution_warm_starts_next_shell_solve(
         evaluator.shell_number_densities[0],
         evaluator.sobolev_inputs[0],
     )
+    accepted_solution = evaluator._calculate_level_solution(*arguments)[0]
+    evaluator._level_solution_cache.clear()
     root_starts: list[np.ndarray] = []
 
     def controlled_root(

@@ -7,12 +7,17 @@ import pandas.testing as pdt
 import pytest
 from astropy import units as u
 
+from tardis import constants as const
 from tardis.plasma.equilibrium.inputs import FixedRateState
 from tardis.plasma.equilibrium.solver import PlasmaEquilibriumSolution
 from tardis.plasma.nonthermal.pynonthermal_solver import (
     NonthermalPlasmaState,
 )
+from tardis.plasma.radiation_field import DilutePlanckianRadiationField
 from tardis.transport.montecarlo.estimators import init_estimators_continuum
+from tardis.transport.montecarlo.estimators.mc_rad_field_solver import (
+    MCRadiationFieldPropertiesSolver,
+)
 from tardis.workflows.high_energy.deposition import DepositionState
 from tardis.workflows.nonthermal_helium_workflow import (
     CoupledPlasmaState,
@@ -1253,6 +1258,108 @@ def test_specialized_optical_workflow_enables_continuum_transport() -> None:
     assert virtual_packet_energies is None
 
 
+@pytest.mark.parametrize("wavelength_angstrom", [584.0, 5000.0, 20000.0])
+@pytest.mark.parametrize("line_estimator", [0.0, 2.0])
+@pytest.mark.parametrize("intensity_damping", [0.5, 2.0])
+def test_line_intensity_damps_packets_but_not_target_fallback(
+    wavelength_angstrom: float,
+    line_estimator: float,
+    intensity_damping: float,
+) -> None:
+    """Verify measured J and target Planck/epsilon branches independently.
+
+    The optical window uses c t_exp/(4 pi t_sim V) times the packet sum
+    and its bolometric damping. UV/IR substitutions and zero-packet epsilon
+    floors already use the final target's w B_nu and must not be damped.
+    Analytic normalization and Planck's law provide independent oracles;
+    rtol=1e-13 permits floating-point arithmetic, with no absolute floor.
+    """
+    temperature = 8000.0
+    dilution_factor = 0.3
+    frequency = (wavelength_angstrom * u.AA).to_value(u.Hz, u.spectral())
+    target_intensity = (
+        dilution_factor * const.sigma_sb.cgs.value * temperature**4 / np.pi
+    )
+    time_simulation = 2.0 * u.s
+    time_explosion = 3.0 * u.s
+    volume = np.array([5.0])
+    workflow = object.__new__(NonthermalHeliumOpticalWorkflow)
+    workflow.transport_state = SimpleNamespace(
+        estimators_continuum=init_estimators_continuum((1, 1), 1),
+        geometry_state_numba=SimpleNamespace(volume=volume),
+        time_of_simulation=time_simulation,
+        time_explosion=time_explosion,
+        estimators_bulk=SimpleNamespace(
+            mean_intensity_total=(
+                target_intensity
+                * 4.0
+                * np.pi
+                * time_simulation.value
+                * volume
+                / intensity_damping
+            )
+        ),
+        estimators_line=SimpleNamespace(
+            mean_intensity_blueward=np.array([[line_estimator]])
+        ),
+        opacity_state_numba=SimpleNamespace(line_list_nu=np.array([frequency])),
+    )
+    radiation_field = DilutePlanckianRadiationField(
+        np.array([temperature]) * u.K, np.array([dilution_factor])
+    )
+    workflow.simulation_state = SimpleNamespace(
+        dilution_factor=np.array([dilution_factor]),
+        t_radiative=np.array([temperature]) * u.K,
+        radiation_field_state=radiation_field,
+    )
+    updated = []
+    workflow.plasma_solver = SimpleNamespace(
+        number_density=pd.DataFrame([[1.0]]),
+        ion_number_density=pd.DataFrame(
+            [[1.0]],
+            index=pd.MultiIndex.from_tuples(
+                [(2, 1)], names=["atomic_number", "ion_number"]
+            ),
+        ),
+        electron_densities=pd.Series([1.0]),
+        t_electrons=np.array([temperature]),
+        lines=pd.DataFrame(index=pd.Index([0])),
+        update=lambda **kwargs: updated.append(kwargs),
+    )
+    radiation_solver = MCRadiationFieldPropertiesSolver(w_epsilon=1.0e-10)
+    workflow.transport_solver = SimpleNamespace(
+        radfield_prop_solver=radiation_solver
+    )
+
+    workflow._capture_continuum_estimators()
+
+    planck_intensity = (
+        dilution_factor
+        * 2.0
+        * const.h.cgs.value
+        * frequency**3
+        / const.c.cgs.value**2
+        / np.expm1(
+            const.h.cgs.value * frequency / (const.k_B.cgs.value * temperature)
+        )
+    )
+    if line_estimator == 0.0:
+        expected = radiation_solver.w_epsilon * planck_intensity
+    elif 2500.0 < wavelength_angstrom < 10000.0:
+        expected = (
+            line_estimator
+            * const.c.cgs.value
+            * time_explosion.value
+            / (4.0 * np.pi * time_simulation.value * volume[0])
+            * intensity_damping
+        )
+    else:
+        expected = planck_intensity
+    npt.assert_allclose(
+        updated[0]["j_blues"].iloc[0, 0], expected, rtol=1.0e-13, atol=0.0
+    )
+
+
 def test_continuum_estimators_remain_finite_in_unvisited_shells() -> None:
     """An unvisited shell keeps zero packet rates without NaN damping.
 
@@ -1281,7 +1388,9 @@ def test_continuum_estimators_remain_finite_in_unvisited_shells() -> None:
         estimators_bulk=SimpleNamespace(
             mean_intensity_total=np.array([1.0, 0.0])
         ),
-        estimators_line=SimpleNamespace(mean_intensity_blueward=object()),
+        estimators_line=SimpleNamespace(
+            mean_intensity_blueward=np.zeros((1, 2))
+        ),
         opacity_state_numba=SimpleNamespace(line_list_nu=np.array([1.0])),
     )
     workflow.simulation_state = SimpleNamespace(

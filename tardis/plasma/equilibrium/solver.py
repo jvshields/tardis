@@ -428,6 +428,28 @@ class PlasmaEquilibriumSolver:
                 f"residuals: {maximum_residual:.3e} > "
                 f"{self.residual_tolerance:.3e}."
             )
+        relative_level_residual = getattr(
+            terminal_evaluation, "relative_level_residual", None
+        )
+        if relative_level_residual is not None:
+            level_values = np.asarray(relative_level_residual, dtype=np.float64)
+            level_tolerance = getattr(
+                evaluator, "level_residual_tolerance", self.residual_tolerance
+            )
+            if (
+                not np.isfinite(level_values).all()
+                or np.max(np.abs(level_values)) > level_tolerance
+            ):
+                level_idx, shell_idx = np.unravel_index(
+                    np.argmax(np.abs(level_values)), level_values.shape
+                )
+                raise RuntimeError(
+                    "Plasma equilibrium solve did not close its relative level "
+                    f"residual at level {relative_level_residual.index[level_idx]}, "
+                    f"shell {relative_level_residual.columns[shell_idx]}: "
+                    f"{level_values[level_idx, shell_idx]:.3e} "
+                    f"(tolerance={level_tolerance:.3e})."
+                )
         logger.info(
             "Finished plasma equilibrium terminal validation in %.3f s "
             "after %d total evaluator calls (maximum residual %.3e; total "

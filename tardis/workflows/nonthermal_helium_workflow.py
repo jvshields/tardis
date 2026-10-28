@@ -1383,8 +1383,10 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         )
         self._continuum_estimators = estimator
 
+        # Damp packet intensities before the estimator solver substitutes
+        # Planck/epsilon fallbacks already evaluated in the target field.
         j_blues = self.transport_solver.radfield_prop_solver.estimate_jblues(
-            transport.estimators_line.mean_intensity_blueward,
+            transport.estimators_line.mean_intensity_blueward * damping,
             self.simulation_state.radiation_field_state,
             transport.time_explosion,
             time,
@@ -1394,7 +1396,7 @@ class NonthermalHeliumOpticalWorkflow(StandardTARDISWorkflow):
         )
         self.plasma_solver.update(
             j_blues=pd.DataFrame(
-                j_blues * damping,
+                j_blues,
                 index=self.plasma_solver.lines.index,
                 columns=self.plasma_solver.number_density.columns,
             )
